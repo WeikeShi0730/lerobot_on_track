@@ -138,14 +138,9 @@ class SO101GamepadController:
     
     def _load_joint_limits(self):
         """Load joint limits from calibration file"""
-        import platform
         import json
         
-        # Find calibration file
-        if platform.system() == "Windows":
-            calib_path = Path.home() / ".cache" / "huggingface" / "lerobot" / "calibration" / "robots" / "so_follower" / f"{self.robot_id}.json"
-        else:
-            calib_path = Path.home() / ".cache" / "calibration" / "so101" / f"{self.robot_id}.json"
+        calib_path = Path.home() / ".cache" / "huggingface" / "lerobot" / "calibration" / "robots" / "so_follower" / f"{self.robot_id}.json"
         
         # Default limits (conservative ±180°)
         self.joint_limits_lower = np.array([-180.0] * self.num_joints, dtype=np.float32)
@@ -455,12 +450,7 @@ def main():
     
     args = parser.parse_args()
     
-    # Check if calibration exists (Windows and Linux paths)
-    import platform
-    if platform.system() == "Windows":
-        calib_path = Path.home() / ".cache" / "huggingface" / "lerobot" / "calibration" / "robots" / "so_follower" / f"{args.robot_id}.json"
-    else:
-        calib_path = Path.home() / ".cache" / "calibration" / "so101" / f"{args.robot_id}.json"
+    calib_path = Path.home() / ".cache" / "huggingface" / "lerobot" / "calibration" / "robots" / "so_follower" / f"{args.robot_id}.json"
     
     if not calib_path.exists():
         print(f"\n⚠️  WARNING: Calibration file not found at {calib_path}")
