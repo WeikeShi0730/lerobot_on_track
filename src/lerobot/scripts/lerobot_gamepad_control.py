@@ -313,7 +313,7 @@ class SO101GamepadController:
             self.enabled = True
         
         # Read analog sticks (apply deadzone, no inversion)
-        left_x = -self.apply_deadzone(self.joystick.get_axis(self.AXIS_LEFT_X))
+        left_x = self.apply_deadzone(self.joystick.get_axis(self.AXIS_LEFT_X))
         left_y = -self.apply_deadzone(self.joystick.get_axis(self.AXIS_LEFT_Y))
         right_y = self.apply_deadzone(self.joystick.get_axis(self.AXIS_RIGHT_Y))
         
