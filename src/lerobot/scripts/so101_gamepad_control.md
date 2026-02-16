@@ -11,7 +11,6 @@ Complete documentation for controlling your SO-101 robotic arm with an Xbox cont
 ## Table of Contents
 
 1. [Quick Start](#quick-start)
-2. [Installation](#installation)
 3. [Controller Mapping](#controller-mapping)
 4. [Features](#features)
 5. [Understanding Calibration](#understanding-calibration)
@@ -41,7 +40,7 @@ pip install "lerobot[feetech]" pygame
 ### Run
 
 ```bash
-python lerobot_gamepad_control.py --port COM6 --robot-id my_awesome_follower_arm
+lerobot-gamepad-control --port COM6 --robot-id my_awesome_follower_arm
 ```
 
 **Windows users:** Use `COM6` (or your port)  
@@ -130,7 +129,7 @@ Three instant-move positions accessible without holding RB:
 
 ### Editing Presets
 
-Open `lerobot_gamepad_control.py` and find `_initialize_presets()` method (around line 200):
+Open `lerobot-gamepad-control` and find `_initialize_presets()` method (around line 200):
 
 ```python
 def _initialize_presets(self):
@@ -223,7 +222,7 @@ print("  LB Button:          Move to STORAGE")
 ### Command Line Options
 
 ```bash
-lerobot_gamepad_control.py [OPTIONS]
+lerobot-gamepad-control [OPTIONS]
 ```
 
 | Option | Type | Default | Description |
@@ -237,17 +236,17 @@ lerobot_gamepad_control.py [OPTIONS]
 
 Slow, precise control:
 ```bash
-lerobot_gamepad_control.py --port COM6 --max-speed 0.5 --frequency 60
+lerobot-gamepad-control --port COM6 --max-speed 0.5 --frequency 60
 ```
 
 Fast, responsive:
 ```bash
-lerobot_gamepad_control.py --port COM6 --max-speed 3.5 --frequency 30
+lerobot-gamepad-control --port COM6 --max-speed 3.5 --frequency 30
 ```
 
 Different robot:
 ```bash
-lerobot_gamepad_control.py --port COM7 --robot-id my_other_robot
+lerobot-gamepad-control --port COM7 --robot-id my_other_robot
 ```
 
 ### Speed Calculation
