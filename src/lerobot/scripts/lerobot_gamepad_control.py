@@ -114,9 +114,9 @@ class SO101GamepadController:
             self.BTN_LSTICK = 9
             self.BTN_RSTICK = 10
             
-        else:  # Windows or macOS
+        else:
             # Windows - Xbox controllers
-            print("  ✓ Using Windows button mapping")
+            print("  ✓ Using Windows or MacOS button mapping")
             self.AXIS_LEFT_X = 0
             self.AXIS_LEFT_Y = 1
             self.AXIS_RIGHT_X = 2
@@ -323,12 +323,16 @@ class SO101GamepadController:
         lt = (self.joystick.get_axis(self.AXIS_LT) + 1.0) / 2.0
         rt = (self.joystick.get_axis(self.AXIS_RT) + 1.0) / 2.0
         
-        # Read D-pad (hat) for wrist roll control
-        # Hat returns (x, y) where x is -1 (left), 0 (center), or 1 (right)
+        # Read D-pad (hat) for wrist flex and wrist roll control
+        # Hat returns (x, y) where x is left/right, y is up/down
+        # x: -1 for left, 1 for right
+        # y: -1 for down, 1 for up
         hat_x = 0
+        hat_y = 0
         if self.joystick.get_numhats() > 0:
             hat = self.joystick.get_hat(0)
-            hat_x = -hat[0]  # -1 for left, 1 for right
+            hat_x = hat[0]  # -1 for left, 1 for right
+            hat_y = hat[1]  # -1 for down, 1 for up
         
         # Map to joint deltas
         action = np.zeros(self.num_joints)
@@ -338,7 +342,7 @@ class SO101GamepadController:
             action[0] = left_x * self.max_speed       # Shoulder pan (base rotation)
             action[1] = left_y * self.max_speed       # Shoulder lift
             action[2] = right_y * self.max_speed      # Elbow flex
-            action[3] = right_x * self.max_speed      # Wrist flex (pitch)
+            action[3] = hat_y * self.max_speed        # Wrist flex (D-pad up/down)
             action[4] = hat_x * self.max_speed        # Wrist roll (D-pad left/right)
             
             # Gripper control (joint 5)
@@ -356,7 +360,8 @@ class SO101GamepadController:
         print("="*60)
         print("\nControls:")
         print("  Left Stick:         Shoulder pan & lift (joints 0-1)")
-        print("  Right Stick:        Elbow flex & wrist flex (joints 2-3)")
+        print("  Right Stick Y:      Elbow flex (joint 2)")
+        print("  D-Pad Up/Down:      Wrist flex (joint 3)")
         print("  D-Pad Left/Right:   Wrist roll (joint 4)")
         print("  LT (Left Trigger):  Close gripper")
         print("  RT (Right Trigger): Open gripper")
