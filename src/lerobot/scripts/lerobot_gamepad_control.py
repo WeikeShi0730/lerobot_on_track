@@ -236,15 +236,22 @@ class SO101GamepadController:
     def _initialize_presets(self):
         """Initialize preset positions"""
         # Ready position: all joints at 0°
-        self.preset_positions['ready'] = np.zeros(self.num_joints, dtype=np.float32)
+        self.preset_positions['ready'] = np.array([
+            0.0,    # shoulder_pan: centered
+            0.0, # shoulder_lift: back
+            0.0,   # elbow_flex: 90° bend
+            0.0,     # wrist_flex: back
+            -90.0,    # wrist_roll: centered
+            0.0     # gripper: neutral
+        ], dtype=np.float32)
         
         # Home position:
         self.preset_positions['home'] = np.array([
             0.0,    # shoulder_pan: centered
-            -90.0,  # shoulder_lift: back
-            90.0,   # elbow_flex: 90° bend
-            -90.0,  # wrist_flex: back
-            0.0,    # wrist_roll: centered
+            -108.0, # shoulder_lift: back
+            95.0,   # elbow_flex: 90° bend
+            55.0,   # wrist_flex: back
+            -90.0,  # wrist_roll: centered
             0.0     # gripper: neutral
         ], dtype=np.float32)
         
@@ -254,7 +261,7 @@ class SO101GamepadController:
             0.0,    # shoulder_lift: pointing up
             -90.0,  # elbow_flex: 90° bend
             0.0,    # wrist_flex: straight
-            0.0,    # wrist_roll: centered
+            -90.0,  # wrist_roll: centered
             0.0     # gripper: neutral
         ], dtype=np.float32)
         
