@@ -85,24 +85,23 @@ class SO101GamepadController:
         self.running = True
         self.gripper_state = 0.0  # -1.0 = closed, 1.0 = open
         
-        # Button/axis indices (standard Xbox controller layout)
-        # These may vary by platform and controller model
-        # Run find_controller_mapping.py to find your values
+        # Button/axis indices vary by PLATFORM (OS), not controller model!
+        # The same controller has different mappings on Windows vs Linux
+        import platform
         
-        # Detect controller type and set appropriate mappings
-        controller_name = self.joystick.get_name().lower()
-        print(f"  Controller name: {self.joystick.get_name()}")
+        system = platform.system()
+        print(f"  Platform: {system}")
+        print(f"  Controller: {self.joystick.get_name()}")
         
-        # Raspberry Pi controllers often have different mappings
-        if "xbox" in controller_name and "360" in controller_name:
-            # Xbox 360 controller (common on Raspberry Pi)
-            print("  ✓ Detected: Xbox 360 Controller (Raspberry Pi mapping)")
+        if system == "Linux":
+            # Linux (including Raspberry Pi) - Xbox controllers
+            print("  ✓ Using Linux/Raspberry Pi button mapping")
             self.AXIS_LEFT_X = 0
             self.AXIS_LEFT_Y = 1
-            self.AXIS_RIGHT_X = 3
-            self.AXIS_RIGHT_Y = 4
-            self.AXIS_LT = 2  # Different on Pi!
-            self.AXIS_RT = 5  # Different on Pi!
+            self.AXIS_RIGHT_X = 3      # Different on Linux!
+            self.AXIS_RIGHT_Y = 4      # Different on Linux!
+            self.AXIS_LT = 2           # Different on Linux!
+            self.AXIS_RT = 5
             
             self.BTN_A = 0
             self.BTN_B = 1
@@ -114,30 +113,10 @@ class SO101GamepadController:
             self.BTN_START = 7
             self.BTN_LSTICK = 9
             self.BTN_RSTICK = 10
-        elif "xbox one" in controller_name or ("xbox" in controller_name and "wireless" in controller_name):
-            # Xbox One / Xbox Wireless controller
-            print("  ✓ Detected: Xbox One/Wireless Controller")
-            self.AXIS_LEFT_X = 0
-            self.AXIS_LEFT_Y = 1
-            self.AXIS_RIGHT_X = 2
-            self.AXIS_RIGHT_Y = 3
-            self.AXIS_LT = 4
-            self.AXIS_RT = 5
             
-            self.BTN_A = 0
-            self.BTN_B = 1
-            self.BTN_X = 2
-            self.BTN_Y = 3
-            self.BTN_LB = 4
-            self.BTN_RB = 5
-            self.BTN_BACK = 6
-            self.BTN_START = 7
-            self.BTN_LSTICK = 8
-            self.BTN_RSTICK = 9
-        else:
-            # Default/Unknown controller - use standard mapping
-            print("  ⚠️  Unknown controller, using default mapping")
-            print("  If controls don't work, run: python find_controller_mapping.py")
+        else:  # Windows or macOS
+            # Windows - Xbox controllers
+            print("  ✓ Using Windows button mapping")
             self.AXIS_LEFT_X = 0
             self.AXIS_LEFT_Y = 1
             self.AXIS_RIGHT_X = 2
