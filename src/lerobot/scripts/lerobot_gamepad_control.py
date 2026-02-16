@@ -313,9 +313,8 @@ class SO101GamepadController:
             self.enabled = True
         
         # Read analog sticks (apply deadzone, no inversion)
-        left_x = self.apply_deadzone(self.joystick.get_axis(self.AXIS_LEFT_X))
-        left_y = self.apply_deadzone(self.joystick.get_axis(self.AXIS_LEFT_Y))
-        right_x = self.apply_deadzone(self.joystick.get_axis(self.AXIS_RIGHT_X))
+        left_x = -self.apply_deadzone(self.joystick.get_axis(self.AXIS_LEFT_X))
+        left_y = -self.apply_deadzone(self.joystick.get_axis(self.AXIS_LEFT_Y))
         right_y = self.apply_deadzone(self.joystick.get_axis(self.AXIS_RIGHT_Y))
         
         # Read triggers (normalize from -1.0~1.0 to 0.0~1.0 range)
@@ -331,7 +330,7 @@ class SO101GamepadController:
         hat_y = 0
         if self.joystick.get_numhats() > 0:
             hat = self.joystick.get_hat(0)
-            hat_x = hat[0]  # -1 for left, 1 for right
+            hat_x = -hat[0]  # -1 for left, 1 for right, ivert
             hat_y = hat[1]  # -1 for down, 1 for up
         
         # Map to joint deltas
@@ -346,10 +345,10 @@ class SO101GamepadController:
             action[4] = hat_x * self.max_speed        # Wrist roll (D-pad left/right)
             
             # Gripper control (joint 5)
-            if rt > 0.1:  # Right trigger - open gripper
-                action[5] = rt * self.max_speed
-            elif lt > 0.1:  # Left trigger - close gripper
-                action[5] = -lt * self.max_speed
+            if rt > 0.1:  # Right trigger - close gripper
+                action[5] = -rt * self.max_speed
+            elif lt > 0.1:  # Left trigger - open gripper
+                action[5] = lt * self.max_speed
         
         return action
     
