@@ -15,6 +15,7 @@ Wire protocol (shared with client):
 """
 
 import argparse
+import collections
 import json
 import socket
 import struct
@@ -50,6 +51,75 @@ def recv_msg(sock: socket.socket) -> dict:
 def send_msg(sock: socket.socket, obj: dict) -> None:
     raw = json.dumps(obj).encode("utf-8")
     sock.sendall(struct.pack("<I", len(raw)) + raw)
+
+
+# ──────────────────────────────────────────────────────────────
+# Observability
+# ──────────────────────────────────────────────────────────────
+
+class ServerStats:
+    """Per-session receive and execution metrics."""
+
+    DISPLAY_INTERVAL = 2.0   # seconds between log lines
+    HZ_WINDOW        = 60    # samples for rolling Hz estimate
+
+    def __init__(self):
+        self._action_times: collections.deque = collections.deque(maxlen=self.HZ_WINDOW)
+        self._exec_times:   collections.deque = collections.deque(maxlen=self.HZ_WINDOW)
+        self._last_action_t: float | None = None
+        self._last_display_t = time.perf_counter()
+        self._session_start  = time.perf_counter()
+        self._total_actions  = 0
+        self._total_pings    = 0
+
+    def record_action(self, recv_t: float, exec_s: float) -> None:
+        # recv_t = timestamp taken BEFORE robot.send_action() — marks when the
+        #          message arrived, independent of how long execution took.
+        # exec_s = how long robot.send_action() itself took (servo comms).
+        if self._last_action_t is not None:
+            self._action_times.append(recv_t - self._last_action_t)
+        self._last_action_t = recv_t
+        self._exec_times.append(exec_s)
+        self._total_actions += 1
+
+    def record_ping(self) -> None:
+        self._total_pings += 1
+
+    def maybe_print(self) -> None:
+        now = time.perf_counter()
+        if now - self._last_display_t < self.DISPLAY_INTERVAL:
+            return
+        self._last_display_t = now
+
+        if len(self._action_times) >= 2:
+            avg_inter = np.mean(self._action_times)
+            recv_hz   = 1.0 / avg_inter if avg_inter > 0 else 0.0
+            jitter_ms = np.std(self._action_times) * 1000.0
+        else:
+            recv_hz   = 0.0
+            jitter_ms = 0.0
+
+        exec_ms = np.mean(self._exec_times) * 1000.0 if self._exec_times else 0.0
+        uptime   = now - self._session_start
+
+        print(
+            f"[server] recv={recv_hz:.1f}Hz  "
+            f"exec={exec_ms:.2f}ms  "
+            f"jitter={jitter_ms:.2f}ms  "
+            f"actions={self._total_actions}  "
+            f"pings={self._total_pings}  "
+            f"up={uptime:.0f}s"
+        )
+
+    def print_summary(self) -> None:
+        uptime   = time.perf_counter() - self._session_start
+        exec_avg = np.mean(self._exec_times) * 1000.0 if self._exec_times else float("nan")
+        print(f"\n[server] ── Session summary ──────────────────────────")
+        print(f"[server]   Uptime:        {uptime:.1f}s")
+        print(f"[server]   Total actions: {self._total_actions}")
+        print(f"[server]   Total pings:   {self._total_pings}")
+        print(f"[server]   Avg exec time: {exec_avg:.2f} ms")
+        print(f"[server] ──────────────────────────────────────────────")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -91,8 +161,7 @@ def get_observation_dict(robot: SO101Follower) -> dict:
 # ──────────────────────────────────────────────────────────────
 
 def handle_client(conn: socket.socket, robot: SO101Follower, verbose: bool) -> None:
-    action_count = 0
-    t0 = time.time()
+    stats = ServerStats()
     try:
         while True:
             msg = recv_msg(conn)
@@ -101,13 +170,21 @@ def handle_client(conn: socket.socket, robot: SO101Follower, verbose: bool) -> N
             # ── action ──────────────────────────────────────────────────
             if mtype == "action":
                 action_dict: dict = msg["action"]   # {joint_key: float, …}
+                recv_t = time.perf_counter()        # arrival time, before exec
+                t0 = time.perf_counter()
                 robot.send_action(action_dict)
-                action_count += 1
+                exec_s = time.perf_counter() - t0
+                stats.record_action(recv_t, exec_s)
+                stats.maybe_print()
 
-                if verbose and action_count % 90 == 0:
-                    hz = action_count / max(time.time() - t0, 1e-6)
+                if verbose:
                     vals = [f"{action_dict.get(k, 0):.1f}" for k in JOINT_KEYS]
-                    print(f"[server] {action_count} actions  (~{hz:.1f} Hz)  pos={vals}")
+                    print(f"[server] action exec={exec_s*1000:.2f}ms  pos={vals}")
+
+            # ── ping → pong ─────────────────────────────────────────────
+            elif mtype == "ping":
+                stats.record_ping()
+                send_msg(conn, {"type": "pong", "seq": msg.get("seq")})
 
             # ── observation request ─────────────────────────────────────
             elif mtype == "obs_request":
@@ -125,6 +202,7 @@ def handle_client(conn: socket.socket, robot: SO101Follower, verbose: bool) -> N
     except ConnectionError as e:
         print(f"[server] Connection lost: {e}")
     finally:
+        stats.print_summary()
         conn.close()
         print("[server] Client connection closed.")
 

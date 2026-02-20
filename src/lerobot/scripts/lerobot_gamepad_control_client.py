@@ -29,6 +29,7 @@ Controls (unchanged from original):
 """
 
 import argparse
+import collections
 import json
 import platform
 import socket
@@ -77,6 +78,130 @@ def connect_to_server(host: str, port: int, retries: int = 10) -> socket.socket:
             print(f"  Attempt {attempt}/{retries} failed: {e}")
             time.sleep(2)
     raise RuntimeError(f"Could not connect to {host}:{port} after {retries} attempts")
+
+
+# ──────────────────────────────────────────────────────────────
+# Observability
+# ──────────────────────────────────────────────────────────────
+
+class ClientStats:
+    """Rolling statistics for the control loop and network."""
+
+    PING_INTERVAL   = 2.0   # seconds between ping measurements
+    DISPLAY_INTERVAL = 1.0  # seconds between status line prints
+    RTT_WINDOW      = 20    # samples kept for rolling RTT stats
+
+    def __init__(self, control_hz: float):
+        self.control_hz = control_hz
+        self._target_dt = 1.0 / control_hz
+
+        # Loop timing — gap between consecutive loop_start timestamps (includes sleep)
+        # so it reflects actual achieved Hz, not just active work time.
+        self._loop_times: collections.deque = collections.deque(maxlen=int(control_hz * 2))
+        self._send_times: collections.deque = collections.deque(maxlen=int(control_hz * 2))
+        self._last_loop_start: float | None = None
+        self._late_frames = 0
+        self._total_frames = 0
+
+        # RTT / ping
+        self._rtts: collections.deque = collections.deque(maxlen=self.RTT_WINDOW)
+        self._last_ping_t = 0.0
+        self._ping_seq = 0
+        self._pending_pings: dict[int, float] = {}   # seq → send time
+
+        # Display
+        self._last_display_t = 0.0
+        self._session_start = time.perf_counter()
+
+    # ── Called each control loop iteration ──────────────────────
+
+    def record_loop(self, loop_start: float) -> None:
+        # Call with the loop_start timestamp; we compute the inter-start interval
+        # ourselves so the sleep is included in the measurement.
+        if self._last_loop_start is not None:
+            interval = loop_start - self._last_loop_start
+            self._loop_times.append(interval)
+            if interval > self._target_dt * 1.5:
+                self._late_frames += 1
+        self._last_loop_start = loop_start
+        self._total_frames += 1
+
+    def record_send(self, send_dt: float) -> None:
+        self._send_times.append(send_dt)
+
+    # ── Ping (call from the main loop) ──────────────────────────
+
+    def maybe_ping(self, sock: socket.socket) -> None:
+        """Send a ping if PING_INTERVAL has elapsed."""
+        now = time.perf_counter()
+        if now - self._last_ping_t >= self.PING_INTERVAL:
+            self._ping_seq += 1
+            self._pending_pings[self._ping_seq] = now   # RTT measured locally, no need to send t
+            send_msg(sock, {"type": "ping", "seq": self._ping_seq})
+            self._last_ping_t = now
+
+    def record_pong(self, msg: dict) -> None:
+        seq = msg.get("seq")
+        if seq in self._pending_pings:
+            rtt_ms = (time.perf_counter() - self._pending_pings.pop(seq)) * 1000.0
+            self._rtts.append(rtt_ms)
+
+    # ── Display ─────────────────────────────────────────────────
+
+    def maybe_print(self, current_pos: np.ndarray, enabled: bool) -> None:
+        now = time.perf_counter()
+        if now - self._last_display_t < self.DISPLAY_INTERVAL:
+            return
+        self._last_display_t = now
+
+        # Loop Hz
+        if len(self._loop_times) >= 2:
+            avg_dt = np.mean(self._loop_times)
+            actual_hz = 1.0 / avg_dt if avg_dt > 0 else 0.0
+        else:
+            actual_hz = 0.0
+
+        # Send latency
+        avg_send_ms = np.mean(self._send_times) * 1000.0 if self._send_times else 0.0
+
+        # RTT
+        if self._rtts:
+            rtt_avg = np.mean(self._rtts)
+            rtt_min = np.min(self._rtts)
+            rtt_max = np.max(self._rtts)
+            rtt_jitter = np.std(self._rtts)
+            rtt_str = f"{rtt_avg:.1f}ms (min={rtt_min:.1f} max={rtt_max:.1f} jitter={rtt_jitter:.1f})"
+        else:
+            rtt_str = "measuring…"
+
+        late_pct = 100.0 * self._late_frames / max(self._total_frames, 1)
+        uptime = now - self._session_start
+
+        state = "ACTIVE" if enabled else "IDLE"
+        pos_str = " ".join(f"{v:6.1f}" for v in current_pos)
+
+        print(
+            f"\r[{state}] "
+            f"Hz={actual_hz:.1f}/{self.control_hz:.0f}  "
+            f"send={avg_send_ms:.2f}ms  "
+            f"rtt={rtt_str}  "
+            f"late={late_pct:.1f}%  "
+            f"up={uptime:.0f}s  "
+            f"pos=[{pos_str}] ",
+            end="", flush=True,
+        )
+
+    def print_summary(self) -> None:
+        uptime = time.perf_counter() - self._session_start
+        rtt_avg = np.mean(self._rtts) if self._rtts else float("nan")
+        late_pct = 100.0 * self._late_frames / max(self._total_frames, 1)
+        print(f"\n\n{'─'*60}")
+        print(f"  Session summary")
+        print(f"  Uptime:       {uptime:.1f}s")
+        print(f"  Total frames: {self._total_frames}")
+        print(f"  Late frames:  {self._late_frames}  ({late_pct:.1f}%)")
+        print(f"  Avg RTT:      {rtt_avg:.1f} ms")
+        print(f"{'─'*60}\n")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -223,6 +348,9 @@ class SO101GamepadClient:
         self.enabled = False
         self.running = True
 
+        # ── Observability ───────────────────────────────────────
+        self.stats = ClientStats(control_frequency)
+
         print(f"  Starting position: {np.round(self.current_position, 2)}")
 
     # ── Helpers ────────────────────────────────────────────────
@@ -235,7 +363,9 @@ class SO101GamepadClient:
 
     def _send_position(self, position: np.ndarray) -> None:
         action_dict = {key: float(position[i]) for i, key in enumerate(JOINT_KEYS)}
+        t0 = time.perf_counter()
         send_msg(self.sock, {"type": "action", "action": action_dict})
+        self.stats.record_send(time.perf_counter() - t0)
 
     # ── Gamepad input (identical logic to original) ─────────────
 
@@ -312,6 +442,20 @@ class SO101GamepadClient:
 
         return action
 
+    def _handle_server_msg(self) -> None:
+        """Non-blocking check for incoming server messages (pongs, etc.)."""
+        self.sock.setblocking(False)
+        try:
+            msg = recv_msg(self.sock)
+            if msg.get("type") == "pong":
+                self.stats.record_pong(msg)
+        except BlockingIOError:
+            pass
+        except Exception:
+            pass
+        finally:
+            self.sock.setblocking(True)
+
     # ── Main loop ──────────────────────────────────────────────
 
     def run(self):
@@ -335,7 +479,12 @@ class SO101GamepadClient:
 
         try:
             while self.running:
-                loop_start = time.time()
+                loop_start = time.perf_counter()
+                self.stats.record_loop(loop_start)   # interval since last start
+
+                # ── Ping / pong ───────────────────────────────────────
+                self.stats.maybe_ping(self.sock)
+                self._handle_server_msg()
 
                 action = self.get_gamepad_input()
 
@@ -346,9 +495,6 @@ class SO101GamepadClient:
                 if isinstance(action, str):
                     preset_name = action.removeprefix("preset_")
                     target = PRESET_POSITIONS.get(preset_name, PRESET_POSITIONS["home"]).copy()
-                    # Clip to calibrated safe ranges
-                    # This prevents sending positions outside the servo's physical limits
-                    # Uses the actual calibrated min/max from your robot's calibration file
                     target = np.clip(target, self.joint_limits_lower, self.joint_limits_upper)
                     self._send_position(target)
                     self.current_position = target
@@ -356,30 +502,25 @@ class SO101GamepadClient:
                     continue
 
                 # ── Continuous control ────────────────────────
-                # Calculate new target position (relative control)
                 target = np.clip(
                     self.current_position + action,
                     self.joint_limits_lower,
                     self.joint_limits_upper,
                 )
                 self._send_position(target)
-                # Update current position
                 self.current_position = target
 
-                # Status print ~once per second
-                if int(time.time() * 30) % 30 == 0:
-                    active = np.any(np.abs(action) > 0.001)
-                    if active or self.enabled:
-                        status = "ACTIVE" if active else "READY"
-                        print(f"[{status}] Position: {np.round(self.current_position, 2)}")
-
-                elapsed = time.time() - loop_start
-                time.sleep(max(0, self.control_dt - elapsed))
+                # ── Stats + display ───────────────────────────
+                self.stats.maybe_print(self.current_position, self.enabled)
+                sleep_time = self.control_dt - (time.perf_counter() - loop_start)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
 
         except KeyboardInterrupt:
             print("\n\nInterrupted by user (Ctrl+C)")
         finally:
-            print("\nShutting down…")
+            self.stats.print_summary()
+            print("Shutting down…")
             self.cleanup()
 
     def cleanup(self):
