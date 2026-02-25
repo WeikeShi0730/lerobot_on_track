@@ -26,6 +26,16 @@ import numpy as np
 
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
+# Motor control (gpiozero + lgpio for Raspberry Pi 5)
+try:
+    from gpiozero import Motor, Device
+    from gpiozero.pins.lgpio import LGPIOFactory
+    Device.pin_factory = LGPIOFactory()
+    MOTORS_AVAILABLE = True
+except Exception as _gpio_err:
+    print(f"⚠️  GPIO motor init failed: {_gpio_err}  — motor control disabled")
+    MOTORS_AVAILABLE = False
+
 
 # ──────────────────────────────────────────────────────────────
 # Wire protocol helpers
@@ -123,6 +133,58 @@ class ServerStats:
 
 
 # ──────────────────────────────────────────────────────────────
+# Motor controller
+# ──────────────────────────────────────────────────────────────
+
+class MotorController:
+    """
+    Wraps two gpiozero Motor objects.
+    Receives speed values in [-1.0, 1.0]:
+      positive → forward, negative → backward, 0 → stop
+    """
+
+    def __init__(
+        self,
+        # Motor 1 pins
+        m1_forward: int = 17,
+        m1_backward: int = 18,
+        m1_enable: int = 25,
+        # Motor 2 pins
+        m2_forward: int = 22,
+        m2_backward: int = 23,
+        m2_enable: int = 24,
+    ):
+        if not MOTORS_AVAILABLE:
+            raise RuntimeError("gpiozero/lgpio not available — cannot create MotorController")
+        self.motor1 = Motor(forward=m1_forward, backward=m1_backward, enable=m1_enable, pwm=True)
+        self.motor2 = Motor(forward=m2_forward, backward=m2_backward, enable=m2_enable, pwm=True)
+        print(f"✓ Motors initialised  M1=(fwd={m1_forward},bwd={m1_backward},en={m1_enable})  "
+              f"M2=(fwd={m2_forward},bwd={m2_backward},en={m2_enable})")
+
+    def set(self, m1: float, m2: float) -> None:
+        """
+        Set motor speeds. Values in [-1.0, 1.0].
+        Positive = forward, negative = backward, 0 = stop (coast).
+        """
+        self._drive(self.motor1, m1)
+        self._drive(self.motor2, m2)
+
+    @staticmethod
+    def _drive(motor: "Motor", value: float) -> None:
+        value = max(-1.0, min(1.0, value))   # clamp
+        if abs(value) < 0.01:
+            motor.stop()
+        elif value > 0:
+            motor.forward(value)
+        else:
+            motor.backward(-value)
+
+    def stop(self) -> None:
+        self.motor1.stop()
+        self.motor2.stop()
+
+
+# ──────────────────────────────────────────────────────────────
 # Robot helpers
 # ──────────────────────────────────────────────────────────────
 
@@ -160,7 +222,7 @@ def get_observation_dict(robot: SO101Follower) -> dict:
 # Client handler
 # ──────────────────────────────────────────────────────────────
 
-def handle_client(conn: socket.socket, robot: SO101Follower, verbose: bool) -> None:
+def handle_client(conn: socket.socket, robot: SO101Follower, motors: "MotorController | None", verbose: bool) -> None:
     stats = ServerStats()
     try:
         while True:
@@ -180,6 +242,18 @@ def handle_client(conn: socket.socket, robot: SO101Follower, verbose: bool) -> N
                 if verbose:
                     vals = [f"{action_dict.get(k, 0):.1f}" for k in JOINT_KEYS]
                     print(f"[server] action exec={exec_s*1000:.2f}ms  pos={vals}")
+
+            # ── motor ────────────────────────────────────────────────────
+            elif mtype == "motor":
+                if motors is not None:
+                    m1 = float(msg.get("motor1", 0.0))
+                    m2 = float(msg.get("motor2", 0.0))
+                    motors.set(m1, m2)
+                    if verbose:
+                        print(f"[server] motor  m1={m1:+.2f}  m2={m2:+.2f}")
+                else:
+                    if verbose:
+                        print("[server] motor msg received but motors not initialised — ignoring")
 
             # ── ping → pong ─────────────────────────────────────────────
             elif mtype == "ping":
@@ -202,6 +276,10 @@ def handle_client(conn: socket.socket, robot: SO101Follower, verbose: bool) -> N
     except ConnectionError as e:
         print(f"[server] Connection lost: {e}")
     finally:
+        # Always stop motors on disconnect for safety
+        if motors is not None:
+            motors.stop()
+            print("[server] Motors stopped.")
         stats.print_summary()
         conn.close()
         print("[server] Client connection closed.")
@@ -218,9 +296,30 @@ def main():
     parser.add_argument("--host",      default="0.0.0.0",      help="Bind address")
     parser.add_argument("--tcp-port",  type=int, default=2222,  help="TCP port")
     parser.add_argument("--verbose",   action="store_true")
+    # Motor GPIO pins (L298N wiring)
+    parser.add_argument("--m1-fwd",    type=int, default=17,   help="Motor 1 forward GPIO (IN1)")
+    parser.add_argument("--m1-bwd",    type=int, default=18,   help="Motor 1 backward GPIO (IN2)")
+    parser.add_argument("--m1-en",     type=int, default=25,   help="Motor 1 enable GPIO (ENA)")
+    parser.add_argument("--m2-fwd",    type=int, default=22,   help="Motor 2 forward GPIO (IN3)")
+    parser.add_argument("--m2-bwd",    type=int, default=23,   help="Motor 2 backward GPIO (IN4)")
+    parser.add_argument("--m2-en",     type=int, default=24,   help="Motor 2 enable GPIO (ENB)")
+    parser.add_argument("--no-motors", action="store_true",    help="Disable motor GPIO (arm only)")
     args = parser.parse_args()
 
     robot = connect_robot(args.port, args.robot_id)
+
+    # Initialise motors (optional — skip with --no-motors if GPIO isn't wired)
+    motors = None
+    if not args.no_motors and MOTORS_AVAILABLE:
+        try:
+            motors = MotorController(
+                m1_forward=args.m1_fwd, m1_backward=args.m1_bwd, m1_enable=args.m1_en,
+                m2_forward=args.m2_fwd, m2_backward=args.m2_bwd, m2_enable=args.m2_en,
+            )
+        except Exception as e:
+            print(f"⚠️  Could not initialise motors: {e}  — motor control disabled")
+    elif args.no_motors:
+        print("ℹ️  Motor control disabled (--no-motors flag)")
 
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -233,11 +332,13 @@ def main():
         while True:
             conn, addr = server_sock.accept()
             print(f"[server] Client connected from {addr}")
-            handle_client(conn, robot, args.verbose)
+            handle_client(conn, robot, motors, args.verbose)
             print("[server] Ready for next client …")
     except KeyboardInterrupt:
         print("\n[server] Shutting down.")
     finally:
+        if motors is not None:
+            motors.stop()
         server_sock.close()
         robot.disconnect()
         print("[server] Clean exit.")

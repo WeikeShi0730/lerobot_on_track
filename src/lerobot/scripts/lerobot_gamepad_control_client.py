@@ -13,18 +13,21 @@ Usage:
     lerobot_gamepad_control_client --host <RASPBERRY_PI_IP>
     lerobot_gamepad_control_client --host 192.168.1.42 --tcp-port 5555
 
-Controls (unchanged from original):
-    Left Stick          Shoulder pan & lift  (joints 0-1)
-    Right Stick Y       Elbow flex           (joint 2)
-    D-Pad Up/Down       Wrist flex           (joint 3)
-    D-Pad Left/Right    Wrist roll           (joint 4)
-    LT                  Open gripper
-    RT                  Close gripper
-    RB (hold)           Enable movement (dead-man switch)
-    A                   Preset → HOME
+Controls:
+    Left Stick          Shoulder pan & lift  (joints 0-1)  [ARM mode]
+    Right Stick Y       Elbow flex           (joint 2)     [ARM mode]
+    D-Pad Up/Down       Wrist flex           (joint 3)     [ARM mode]
+    D-Pad Left/Right    Wrist roll           (joint 4)     [ARM mode]
+    LT / RT             Gripper open/close                 [ARM mode]
+    RT                  Drive forward                      [MOTOR mode]
+    LT                  Drive backward                     [MOTOR mode]
+    Left Stick X        Steer left/right                   [MOTOR mode]
+    RB                  Switch to ARM mode
+    LB                  Switch to MOTOR mode
+    RB + LB             IDLE (stop everything)
+    A / B               Preset → HOME
     X                   Preset → READY
     Y                   Preset → VERTICAL
-    B                   Preset → HOME
     Start               Exit
 """
 
@@ -345,8 +348,13 @@ class SO101GamepadClient:
         # ── State ──────────────────────────────────────────────
         self.joint_limits_lower, self.joint_limits_upper = load_joint_limits(robot_id)
         self.current_position = PRESET_POSITIONS["home"].copy()
-        self.enabled = False
         self.running = True
+
+        # Mode toggle state
+        # mode = None | "arm" | "motor"
+        self.mode = None
+        self._prev_rb = False   # previous frame button states for edge detection
+        self._prev_lb = False
 
         # ── Observability ───────────────────────────────────────
         self.stats = ClientStats(control_frequency)
@@ -367,24 +375,55 @@ class SO101GamepadClient:
         send_msg(self.sock, {"type": "action", "action": action_dict})
         self.stats.record_send(time.perf_counter() - t0)
 
+    def _send_motor(self, motor1: float, motor2: float) -> None:
+        """Send motor command. Values -1.0 to 1.0 (negative = backward, 0 = stop)."""
+        send_msg(self.sock, {"type": "motor", "motor1": float(motor1), "motor2": float(motor2)})
+
     # ── Gamepad input (identical logic to original) ─────────────
 
     def get_gamepad_input(self):
         """
         Returns one of:
-          np.ndarray  – delta action (6 floats)
-          str         – preset name ("preset_home", "preset_ready", "preset_vertical")
-          None        – exit requested
+          np.ndarray        – arm delta action (6 floats)        [arm mode]
+          dict              – motor command {"motor": True, ...}  [motor mode]
+          str               – preset name
+          None              – exit requested
         """
         pygame.event.pump()
 
-        rb_pressed = self.joystick.get_button(self.BTN_RB)
+        rb = self.joystick.get_button(self.BTN_RB)
+        lb = self.joystick.get_button(self.BTN_LB)
 
+        # Rising-edge detection (tap, not hold)
+        rb_pressed = rb and not self._prev_rb
+        lb_pressed = lb and not self._prev_lb
+
+        self._prev_rb = rb
+        self._prev_lb = lb
+
+        # ── Mode switching ────────────────────────────────────────
+        # RB → ARM mode
+        # LB → MOTOR mode
+        # RB + LB simultaneously → IDLE, stop motors
+        if rb_pressed and lb_pressed:
+            print("Mode: IDLE (both bumpers)")
+            self.mode = None
+            self._send_motor(0.0, 0.0)
+        elif rb_pressed:
+            if self.mode != "arm":
+                print("Mode: ARM")
+                self.mode = "arm"
+                self._send_motor(0.0, 0.0)   # stop motors when switching to arm
+        elif lb_pressed:
+            if self.mode != "motor":
+                print("Mode: MOTOR")
+                self.mode = "motor"
+
+        # ── Preset buttons (work in any mode) ────────────────────
         if self.joystick.get_button(self.BTN_START):
             self.running = False
             return None
-
-        if self.joystick.get_button(self.BTN_A):
+        if self.joystick.get_button(self.BTN_A) or self.joystick.get_button(self.BTN_B):
             print("→ Moving to HOME position")
             return "preset_home"
         if self.joystick.get_button(self.BTN_X):
@@ -393,54 +432,47 @@ class SO101GamepadClient:
         if self.joystick.get_button(self.BTN_Y):
             print("→ Moving to VERTICAL position")
             return "preset_vertical"
-        if self.joystick.get_button(self.BTN_B):
-            print("Resetting to HOME position…")
-            return "preset_home"
 
-        # If RB not pressed, don't move
-        if not rb_pressed:
-            if self.enabled:
-                print("Control disabled - release RB")
-                self.enabled = False
-            return np.zeros(len(JOINT_KEYS))
+        # ── Motor mode ────────────────────────────────────────────
+        if self.mode == "motor":
+            lt = (self.joystick.get_axis(self.AXIS_LT) + 1.0) / 2.0
+            rt = (self.joystick.get_axis(self.AXIS_RT) + 1.0) / 2.0
+            throttle = rt - lt   # positive = forward, negative = backward
+            turn = self.apply_deadzone(self.joystick.get_axis(self.AXIS_LEFT_X))
 
-        if not self.enabled:
-            print("Control enabled - hold RB to move")
-            self.enabled = True
+            m1 = max(-1.0, min(1.0, throttle + turn))
+            m2 = max(-1.0, min(1.0, throttle - turn))
+            return {"motor": True, "m1": m1, "m2": m2}
 
-        # Read analog sticks (apply deadzone, inversion)
-        left_x = self.apply_deadzone(self.joystick.get_axis(self.AXIS_LEFT_X))
-        left_y = -self.apply_deadzone(self.joystick.get_axis(self.AXIS_LEFT_Y))
-        right_y = self.apply_deadzone(self.joystick.get_axis(self.AXIS_RIGHT_Y))
+        # ── Arm mode ──────────────────────────────────────────────
+        if self.mode == "arm":
+            left_x  = self.apply_deadzone(self.joystick.get_axis(self.AXIS_LEFT_X))
+            left_y  = -self.apply_deadzone(self.joystick.get_axis(self.AXIS_LEFT_Y))
+            right_y = self.apply_deadzone(self.joystick.get_axis(self.AXIS_RIGHT_Y))
 
-        # Read triggers (normalize from -1.0~1.0 to 0.0~1.0 range)
-        # Xbox triggers default to -1.0 when not pressed, +1.0 when fully pressed
-        lt = (self.joystick.get_axis(self.AXIS_LT) + 1.0) / 2.0
-        rt = (self.joystick.get_axis(self.AXIS_RT) + 1.0) / 2.0
+            lt = (self.joystick.get_axis(self.AXIS_LT) + 1.0) / 2.0
+            rt = (self.joystick.get_axis(self.AXIS_RT) + 1.0) / 2.0
 
-        # Read D-pad (hat) for wrist flex and wrist roll control
-        # Hat returns (x, y) where x is left/right, y is up/down
-        # x: -1 for left, 1 for right
-        # y: -1 for down, 1 for up
-        hat_x, hat_y = 0, 0
-        if self.joystick.get_numhats() > 0:
-            hat = self.joystick.get_hat(0)
-            hat_x = -hat[0]
-            hat_y = hat[1]
+            hat_x, hat_y = 0, 0
+            if self.joystick.get_numhats() > 0:
+                hat = self.joystick.get_hat(0)
+                hat_x = -hat[0]
+                hat_y = hat[1]
 
-        action = np.zeros(len(JOINT_KEYS))
-        action[0] = left_x * self.max_speed          # shoulder_pan
-        action[1] = left_y * self.max_speed          # shoulder_lift
-        action[2] = right_y * self.max_speed         # elbow_flex
-        action[3] = hat_y * self.max_speed           # wrist_flex
-        action[4] = hat_x * self.max_speed           # wrist_roll
-        # Gripper control
-        if rt > 0.1:
-            action[5] = -rt * self.max_speed         # close gripper
-        elif lt > 0.1:
-            action[5] = lt * self.max_speed          # open gripper
+            action = np.zeros(len(JOINT_KEYS))
+            action[0] = left_x  * self.max_speed   # shoulder_pan
+            action[1] = left_y  * self.max_speed   # shoulder_lift
+            action[2] = right_y * self.max_speed   # elbow_flex
+            action[3] = hat_y   * self.max_speed   # wrist_flex
+            action[4] = hat_x   * self.max_speed   # wrist_roll
+            if rt > 0.1:
+                action[5] = -rt * self.max_speed   # close gripper
+            elif lt > 0.1:
+                action[5] =  lt * self.max_speed   # open gripper
+            return action
 
-        return action
+        # ── Idle — send zeros to keep things safe ─────────────────
+        return np.zeros(len(JOINT_KEYS))
 
     def _handle_server_msg(self) -> None:
         """Non-blocking check for incoming server messages (pongs, etc.)."""
@@ -463,17 +495,22 @@ class SO101GamepadClient:
         print("SO-101 GAMEPAD CLIENT  →  Raspberry Pi")
         print("=" * 60)
         print("\nControls:")
+        print("  ── MOTOR mode (tap LB to toggle) ─────────────────────")
+        print("  RT:                  Drive forward")
+        print("  LT:                  Drive backward")
+        print("  Left Stick X:        Steer left / right (works while moving)")
+        print("  ── ARM mode (tap RB to toggle) ───────────────────────")
         print("  Left Stick:          Shoulder pan & lift  (joints 0-1)")
         print("  Right Stick Y:       Elbow flex           (joint 2)")
         print("  D-Pad Up/Down:       Wrist flex           (joint 3)")
         print("  D-Pad Left/Right:    Wrist roll           (joint 4)")
         print("  LT:                  Open gripper")
         print("  RT:                  Close gripper")
-        print("  RB (hold):           Enable movement (SAFETY)")
-        print("  A:                   HOME  B: HOME")
-        print("  X:                   READY   Y: VERTICAL")
+        print("  ── General ───────────────────────────────────────────")
+        print("  RB + LB:             Force idle (stop everything)")
+        print("  A / B:               HOME   X: READY   Y: VERTICAL")
         print("  Start:               Exit")
-        print("\n⚠️  SAFETY: Hold RB button to enable manual movement!")
+        print("\nℹ️  Tap RB → ARM mode  |  Tap LB → MOTOR mode  |  Tap again → IDLE")
         print("Starting in 3 seconds…\n")
         time.sleep(3)
 
@@ -490,6 +527,15 @@ class SO101GamepadClient:
 
                 if action is None:
                     break
+
+                # ── Motor control (motor mode) ─────────────────
+                if isinstance(action, dict) and action.get("motor"):
+                    self._send_motor(action["m1"], action["m2"])
+                    self.stats.maybe_print(self.current_position, False)
+                    sleep_time = self.control_dt - (time.perf_counter() - loop_start)
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    continue
 
                 # ── Preset handling ────────────────────────────
                 if isinstance(action, str):
@@ -511,7 +557,7 @@ class SO101GamepadClient:
                 self.current_position = target
 
                 # ── Stats + display ───────────────────────────
-                self.stats.maybe_print(self.current_position, self.enabled)
+                self.stats.maybe_print(self.current_position, self.mode == "arm")
                 sleep_time = self.control_dt - (time.perf_counter() - loop_start)
                 if sleep_time > 0:
                     time.sleep(sleep_time)
