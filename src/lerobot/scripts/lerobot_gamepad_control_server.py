@@ -6,9 +6,17 @@ Receives action dicts from the Windows gamepad client (or policy client)
 over TCP and drives the SO-101 follower arm.
 
 Usage:
-    lerobot-gamepad-control-server
-    lerobot-gamepad-control-server --port /dev/ttyACM0 --robot-id so101_follower
-    lerobot-gamepad-control-server --host 0.0.0.0 --tcp-port 5555
+    # Both arm and motors (default)
+    python3 lerobot_gamepad_control_server.py
+
+    # Arm only
+    python3 lerobot_gamepad_control_server.py --no-motors
+
+    # Motors only
+    python3 lerobot_gamepad_control_server.py --no-arm
+
+    # Custom serial port or TCP port
+    python3 lerobot_gamepad_control_server.py --port /dev/ttyACM1 --tcp-port 5555
 
 Wire protocol (shared with client):
     Each message = [4-byte little-endian uint32 length][UTF-8 JSON payload]
@@ -24,7 +32,15 @@ from pathlib import Path
 
 import numpy as np
 
-from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
+# Arm control (lerobot SO-101)
+try:
+    from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
+    ARM_AVAILABLE = True
+except Exception as _arm_import_err:
+    print(f"⚠️  lerobot import failed: {_arm_import_err}  — arm control disabled")
+    SO101Follower = None
+    SO101FollowerConfig = None
+    ARM_AVAILABLE = False
 
 # Motor control (gpiozero + lgpio for Raspberry Pi 5)
 try:
@@ -198,17 +214,24 @@ JOINT_KEYS = [
 ]
 
 
-# Initialize robot
-def connect_robot(port: str, robot_id: str) -> SO101Follower:
-    print(f"✓ Connecting to SO-101 on {port} (id={robot_id}) …")
-    config = SO101FollowerConfig(port=port, id=robot_id)
-    robot = SO101Follower(config)
-    robot.connect()
-    print("✓ Robot connected.")
-    return robot
+def connect_robot_arm(port: str, robot_id: str):
+    """Connect to SO-101 arm. Returns robot instance or None on failure."""
+    if not ARM_AVAILABLE:
+        print("ℹ️  lerobot not available — arm disabled")
+        return None
+    try:
+        print(f"  Connecting to SO-101 on {port} (id={robot_id}) …")
+        config = SO101FollowerConfig(port=port, id=robot_id)
+        robot = SO101Follower(config)
+        robot.connect()
+        print("✓ Arm connected.")
+        return robot
+    except Exception as e:
+        print(f"⚠️  Could not connect to arm: {e}  — arm control disabled")
+        return None
 
 
-def get_observation_dict(robot: SO101Follower) -> dict:
+def get_observation_dict(robot) -> dict:
     """Return all scalar observations as a plain Python dict (JSON-serialisable)."""
     obs = robot.get_observation()
     return {
@@ -222,26 +245,45 @@ def get_observation_dict(robot: SO101Follower) -> dict:
 # Client handler
 # ──────────────────────────────────────────────────────────────
 
-def handle_client(conn: socket.socket, robot: SO101Follower, motors: "MotorController | None", verbose: bool) -> None:
+def handle_client(conn: socket.socket, robot_arm, motors: "MotorController | None", verbose: bool) -> None:
     stats = ServerStats()
     try:
         while True:
             msg = recv_msg(conn)
             mtype = msg.get("type")
 
-            # ── action ──────────────────────────────────────────────────
-            if mtype == "action":
-                action_dict: dict = msg["action"]   # {joint_key: float, …}
-                recv_t = time.perf_counter()        # arrival time, before exec
-                t0 = time.perf_counter()
-                robot.send_action(action_dict)
-                exec_s = time.perf_counter() - t0
-                stats.record_action(recv_t, exec_s)
-                stats.maybe_print()
+            # ── mode_request ─────────────────────────────────────────────
+            # Client tapped RB or LB — check if that mode is available and reply
+            if mtype == "mode_request":
+                requested = msg.get("mode")
+                if requested == "arm":
+                    ok     = robot_arm is not None
+                    reason = "arm not connected" if not ok else ""
+                elif requested == "motor":
+                    ok     = motors is not None
+                    reason = "motors not connected" if not ok else ""
+                else:
+                    ok     = False
+                    reason = f"unknown mode '{requested}'"
+                send_msg(conn, {"type": "mode_response", "mode": requested, "ok": ok, "reason": reason})
+                print(f"[server] mode_request '{requested}' → {'granted' if ok else f'denied ({reason})'}")
 
-                if verbose:
-                    vals = [f"{action_dict.get(k, 0):.1f}" for k in JOINT_KEYS]
-                    print(f"[server] action exec={exec_s*1000:.2f}ms  pos={vals}")
+            # ── action (arm) ─────────────────────────────────────────────
+            if mtype == "action":
+                if robot_arm is not None:
+                    action_dict: dict = msg["action"] # {joint_key: float, …}
+                    recv_t = time.perf_counter()
+                    t0 = time.perf_counter()
+                    robot_arm.send_action(action_dict)
+                    exec_s = time.perf_counter() - t0
+                    stats.record_action(recv_t, exec_s)
+                    stats.maybe_print()
+                    if verbose:
+                        vals = [f"{action_dict.get(k, 0):.1f}" for k in JOINT_KEYS]
+                        print(f"[server] action exec={exec_s*1000:.2f}ms  pos={vals}")
+                else:
+                    if verbose:
+                        print("[server] action msg received but arm not connected — ignoring")
 
             # ── motor ────────────────────────────────────────────────────
             elif mtype == "motor":
@@ -253,7 +295,7 @@ def handle_client(conn: socket.socket, robot: SO101Follower, motors: "MotorContr
                         print(f"[server] motor  m1={m1:+.2f}  m2={m2:+.2f}")
                 else:
                     if verbose:
-                        print("[server] motor msg received but motors not initialised — ignoring")
+                        print("[server] motor msg received but motors not connected — ignoring")
 
             # ── ping → pong ─────────────────────────────────────────────
             elif mtype == "ping":
@@ -262,8 +304,11 @@ def handle_client(conn: socket.socket, robot: SO101Follower, motors: "MotorContr
 
             # ── observation request ─────────────────────────────────────
             elif mtype == "obs_request":
-                obs = get_observation_dict(robot)
-                send_msg(conn, {"type": "obs", "data": obs})
+                if robot_arm is not None:
+                    obs = get_observation_dict(robot_arm)
+                    send_msg(conn, {"type": "obs", "data": obs})
+                else:
+                    send_msg(conn, {"type": "obs", "data": {}, "error": "arm not connected"})
 
             # ── graceful disconnect ─────────────────────────────────────
             elif mtype == "disconnect":
@@ -276,7 +321,6 @@ def handle_client(conn: socket.socket, robot: SO101Follower, motors: "MotorContr
     except ConnectionError as e:
         print(f"[server] Connection lost: {e}")
     finally:
-        # Always stop motors on disconnect for safety
         if motors is not None:
             motors.stop()
             print("[server] Motors stopped.")
@@ -290,49 +334,80 @@ def handle_client(conn: socket.socket, robot: SO101Follower, motors: "MotorContr
 # ──────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="SO-101 robot TCP server (Raspberry Pi)")
-    parser.add_argument("--port",      default="/dev/ttyACM0", help="Serial port for SO-101")
+    parser = argparse.ArgumentParser(
+        description="SO-101 + motor TCP server (Raspberry Pi)\n"
+                    "Run with arm only, motors only, or both — any combination is valid.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # TCP
+    parser.add_argument("--host",      default="0.0.0.0",      help="Bind address (default: 0.0.0.0)")
+    parser.add_argument("--tcp-port",  type=int, default=2222,  help="TCP port (default: 2222)")
+    parser.add_argument("--verbose",   action="store_true",     help="Print every action/motor command")
+    # Arm
+    parser.add_argument("--no-arm",    action="store_true",     help="Disable arm (motors only)")
+    parser.add_argument("--port",      default="/dev/ttyACM0",  help="Serial port for SO-101 (default: /dev/ttyACM0)")
     parser.add_argument("--robot-id",  default="so101_follower")
-    parser.add_argument("--host",      default="0.0.0.0",      help="Bind address")
-    parser.add_argument("--tcp-port",  type=int, default=2222,  help="TCP port")
-    parser.add_argument("--verbose",   action="store_true")
-    # Motor GPIO pins (L298N wiring)
-    parser.add_argument("--m1-fwd",    type=int, default=17,   help="Motor 1 forward GPIO (IN1)")
-    parser.add_argument("--m1-bwd",    type=int, default=18,   help="Motor 1 backward GPIO (IN2)")
-    parser.add_argument("--m1-en",     type=int, default=25,   help="Motor 1 enable GPIO (ENA)")
-    parser.add_argument("--m2-fwd",    type=int, default=22,   help="Motor 2 forward GPIO (IN3)")
-    parser.add_argument("--m2-bwd",    type=int, default=23,   help="Motor 2 backward GPIO (IN4)")
-    parser.add_argument("--m2-en",     type=int, default=24,   help="Motor 2 enable GPIO (ENB)")
-    parser.add_argument("--no-motors", action="store_true",    help="Disable motor GPIO (arm only)")
+    # Motors
+    parser.add_argument("--no-motors", action="store_true",     help="Disable motors (arm only)")
+    parser.add_argument("--m1-fwd",    type=int, default=17,    help="Motor 1 forward GPIO / IN1 (default: 17)")
+    parser.add_argument("--m1-bwd",    type=int, default=18,    help="Motor 1 backward GPIO / IN2 (default: 18)")
+    parser.add_argument("--m1-en",     type=int, default=25,    help="Motor 1 enable GPIO / ENA (default: 25)")
+    parser.add_argument("--m2-fwd",    type=int, default=22,    help="Motor 2 forward GPIO / IN3 (default: 22)")
+    parser.add_argument("--m2-bwd",    type=int, default=23,    help="Motor 2 backward GPIO / IN4 (default: 23)")
+    parser.add_argument("--m2-en",     type=int, default=24,    help="Motor 2 enable GPIO / ENB (default: 24)")
     args = parser.parse_args()
 
-    robot = connect_robot(args.port, args.robot_id)
+    print("\n" + "=" * 55)
+    print("  SO-101 + Motor TCP Server")
+    print("=" * 55)
 
-    # Initialise motors (optional — skip with --no-motors if GPIO isn't wired)
+    # ── Arm ───────────────────────────────────────────────────
+    robot_arm = None
+    if args.no_arm:
+        print("ℹ️  Arm:    DISABLED (--no-arm)")
+    else:
+        robot_arm = connect_robot_arm(args.port, args.robot_id)
+        if robot_arm is None:
+            print("ℹ️  Arm:    DISABLED (connection failed — motors-only mode)")
+        else:
+            print(f"✓  Arm:    ENABLED  ({args.port})")
+
+    # ── Motors ────────────────────────────────────────────────
     motors = None
-    if not args.no_motors and MOTORS_AVAILABLE:
+    if args.no_motors:
+        print("ℹ️  Motors: DISABLED (--no-motors)")
+    elif not MOTORS_AVAILABLE:
+        print("ℹ️  Motors: DISABLED (gpiozero/lgpio not available)")
+    else:
         try:
             motors = MotorController(
                 m1_forward=args.m1_fwd, m1_backward=args.m1_bwd, m1_enable=args.m1_en,
                 m2_forward=args.m2_fwd, m2_backward=args.m2_bwd, m2_enable=args.m2_en,
             )
+            print(f"✓  Motors: ENABLED  (M1: IN1={args.m1_fwd}/IN2={args.m1_bwd}/ENA={args.m1_en}  "
+                  f"M2: IN3={args.m2_fwd}/IN4={args.m2_bwd}/ENB={args.m2_en})")
         except Exception as e:
-            print(f"⚠️  Could not initialise motors: {e}  — motor control disabled")
-    elif args.no_motors:
-        print("ℹ️  Motor control disabled (--no-motors flag)")
+            print(f"⚠️  Motors: DISABLED (init failed: {e})")
 
+    # ── Sanity check ──────────────────────────────────────────
+    if robot_arm is None and motors is None:
+        print("\n⚠️  WARNING: Neither arm nor motors are connected.")
+        print("   The server will run but all incoming commands will be ignored.")
+
+    # ── Start TCP server ──────────────────────────────────────
+    print("=" * 55)
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind((args.host, args.tcp_port))
     server_sock.listen(1)
     print(f"✓ Listening on {args.host}:{args.tcp_port} …")
-    print("  Waiting for Windows client …\n")
+    print("  Waiting for client …\n")
 
     try:
         while True:
             conn, addr = server_sock.accept()
             print(f"[server] Client connected from {addr}")
-            handle_client(conn, robot, motors, args.verbose)
+            handle_client(conn, robot_arm, motors, args.verbose)
             print("[server] Ready for next client …")
     except KeyboardInterrupt:
         print("\n[server] Shutting down.")
@@ -340,7 +415,8 @@ def main():
         if motors is not None:
             motors.stop()
         server_sock.close()
-        robot.disconnect()
+        if robot_arm is not None:
+            robot_arm.disconnect()
         print("[server] Clean exit.")
 
 
