@@ -386,7 +386,8 @@ class SO101GamepadClient:
         Returns one of:
           np.ndarray        – arm delta action (6 floats)        [arm mode]
           dict              – motor command {"motor": True, ...}  [motor mode]
-          str               – preset name
+          str "preset_*"    – preset name
+          str "idle"        – no mode active, nothing to send
           None              – exit requested
         """
         pygame.event.pump()
@@ -402,22 +403,17 @@ class SO101GamepadClient:
         self._prev_lb = lb
 
         # ── Mode switching ────────────────────────────────────────
-        # RB → ARM mode
-        # LB → MOTOR mode
-        # RB + LB simultaneously → IDLE, stop motors
+        # On bumper tap, ask the server if that mode is available.
+        # Server replies with {"type": "mode_response", "ok": bool, "reason": str}
+        # _handle_server_msg() picks up the reply and updates self.mode.
         if rb_pressed and lb_pressed:
             print("Mode: IDLE (both bumpers)")
             self.mode = None
             self._send_motor(0.0, 0.0)
         elif rb_pressed:
-            if self.mode != "arm":
-                print("Mode: ARM")
-                self.mode = "arm"
-                self._send_motor(0.0, 0.0)   # stop motors when switching to arm
+            send_msg(self.sock, {"type": "mode_request", "mode": "arm"})
         elif lb_pressed:
-            if self.mode != "motor":
-                print("Mode: MOTOR")
-                self.mode = "motor"
+            send_msg(self.sock, {"type": "mode_request", "mode": "motor"})
 
         # ── Preset buttons (work in any mode) ────────────────────
         if self.joystick.get_button(self.BTN_START):
@@ -440,8 +436,8 @@ class SO101GamepadClient:
             throttle = rt - lt   # positive = forward, negative = backward
             turn = self.apply_deadzone(self.joystick.get_axis(self.AXIS_LEFT_X))
 
-            m1 = max(-1.0, min(1.0, throttle + turn))
-            m2 = max(-1.0, min(1.0, throttle - turn))
+            m1 = max(-1.0, min(1.0, throttle - turn))
+            m2 = max(-1.0, min(1.0, throttle + turn))
             return {"motor": True, "m1": m1, "m2": m2}
 
         # ── Arm mode ──────────────────────────────────────────────
@@ -471,16 +467,31 @@ class SO101GamepadClient:
                 action[5] =  lt * self.max_speed   # open gripper
             return action
 
-        # ── Idle — send zeros to keep things safe ─────────────────
-        return np.zeros(len(JOINT_KEYS))
+        # ── Idle — nothing to send ─────────────────────────────────
+        return "idle"
 
     def _handle_server_msg(self) -> None:
-        """Non-blocking check for incoming server messages (pongs, etc.)."""
+        """Non-blocking check for incoming server messages (pongs, mode_response, etc.)."""
         self.sock.setblocking(False)
         try:
             msg = recv_msg(self.sock)
-            if msg.get("type") == "pong":
+            mtype = msg.get("type")
+
+            if mtype == "pong":
                 self.stats.record_pong(msg)
+
+            elif mtype == "mode_response":
+                requested = msg.get("mode")
+                ok        = msg.get("ok", False)
+                reason    = msg.get("reason", "")
+                if ok:
+                    if requested == "arm":
+                        self._send_motor(0.0, 0.0)   # stop motors when entering arm mode
+                    self.mode = requested
+                    print(f"Mode: {requested.upper()}")
+                else:
+                    print(f"⚠️  {requested.upper()} mode unavailable — {reason}")
+
         except BlockingIOError:
             pass
         except Exception:
@@ -494,6 +505,7 @@ class SO101GamepadClient:
         print("\n" + "=" * 60)
         print("SO-101 GAMEPAD CLIENT  →  Raspberry Pi")
         print("=" * 60)
+
         print("\nControls:")
         print("  ── MOTOR mode (tap LB to toggle) ─────────────────────")
         print("  RT:                  Drive forward")
@@ -528,10 +540,17 @@ class SO101GamepadClient:
                 if action is None:
                     break
 
-                # ── Motor control (motor mode) ─────────────────
+                # ── Motor control ──────────────────────────────
                 if isinstance(action, dict) and action.get("motor"):
                     self._send_motor(action["m1"], action["m2"])
                     self.stats.maybe_print(self.current_position, False)
+                    sleep_time = self.control_dt - (time.perf_counter() - loop_start)
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    continue
+
+                # ── Idle ───────────────────────────────────────
+                if action == "idle":
                     sleep_time = self.control_dt - (time.perf_counter() - loop_start)
                     if sleep_time > 0:
                         time.sleep(sleep_time)
@@ -547,7 +566,7 @@ class SO101GamepadClient:
                     time.sleep(0.5)
                     continue
 
-                # ── Continuous control ────────────────────────
+                # ── Arm continuous control ─────────────────────
                 target = np.clip(
                     self.current_position + action,
                     self.joint_limits_lower,
