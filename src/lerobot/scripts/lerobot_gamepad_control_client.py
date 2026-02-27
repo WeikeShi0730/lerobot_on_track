@@ -550,7 +550,7 @@ class SO101GamepadClient:
                     continue
 
                 # ── Idle ───────────────────────────────────────
-                if action == "idle":
+                if isinstance(action, str) and action == "idle":
                     sleep_time = self.control_dt - (time.perf_counter() - loop_start)
                     if sleep_time > 0:
                         time.sleep(sleep_time)
