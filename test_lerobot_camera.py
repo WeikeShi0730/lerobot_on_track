@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Test script for LeRobot OpenCV camera - Dual Camera Version
-Displays feeds from two cameras side by side
+Test script for LeRobot OpenCV camera - Dual Camera Version (Robust)
+Displays feeds from two cameras side by side with auto-configuration
 """
 
 import cv2
@@ -13,77 +13,116 @@ from lerobot.cameras.opencv.camera_opencv import OpenCVCamera
 from lerobot.cameras.configs import ColorMode, Cv2Rotation
 
 
+def try_connect_camera(device_path, label="Camera", rotation=Cv2Rotation.NO_ROTATION):
+    """Try to connect to camera with fallback configurations"""
+    
+    # Configuration attempts in order of preference
+    configs = [
+        # Try with default settings (no explicit width/height/fps)
+        {
+            "index_or_path": device_path,
+            "color_mode": ColorMode.RGB,
+            "rotation": rotation
+        },
+        # Try with 640x480 @ 30fps
+        {
+            "index_or_path": device_path,
+            "fps": 30,
+            "width": 640,
+            "height": 480,
+            "color_mode": ColorMode.RGB,
+            "rotation": rotation
+        },
+        # Try with 640x480 @ 15fps
+        {
+            "index_or_path": device_path,
+            "fps": 15,
+            "width": 640,
+            "height": 480,
+            "color_mode": ColorMode.RGB,
+            "rotation": rotation
+        },
+        # Try with 320x240 @ 30fps (lower resolution)
+        {
+            "index_or_path": device_path,
+            "fps": 30,
+            "width": 320,
+            "height": 240,
+            "color_mode": ColorMode.RGB,
+            "rotation": rotation
+        },
+    ]
+    
+    for i, config_dict in enumerate(configs):
+        try:
+            config = OpenCVCameraConfig(**config_dict)
+            camera = OpenCVCamera(config)
+            camera.connect()
+            
+            # Try to read a test frame to verify it works
+            test_frame = camera.async_read(timeout_ms=2000)
+            if test_frame is not None:
+                print(f"✓ {label} connected successfully!")
+                print(f"  Config: {config.width if hasattr(config, 'width') else 'auto'}x{config.height if hasattr(config, 'height') else 'auto'} @ {config.fps if hasattr(config, 'fps') else 'auto'}fps")
+                return camera, config, test_frame.shape
+            else:
+                camera.disconnect()
+                print(f"  Attempt {i+1}: Camera opened but no frame received")
+        except Exception as e:
+            print(f"  Attempt {i+1} failed: {str(e)[:100]}")
+            continue
+    
+    return None, None, None
+
+
 def main():
-    print("LeRobot OpenCV Dual Camera Test")
+    print("LeRobot OpenCV Dual Camera Test (Robust)")
     print("=" * 60)
     system = platform.system()
     print(f"Platform: {system}")
     
-    # Configure both cameras
-    # Use device paths from lerobot-find-cameras output
-    # These are the FFMPEG cameras with actual video streams
-    camera_index_1 = "/dev/video1"  # First camera (Camera #0 from scan)
-    camera_index_2 = "/dev/video3"  # Second camera (Camera #5 from scan)
-    
-    # Shared configuration for both cameras
-    width = 640
-    height = 480
-    fps = 15
+    # Camera device paths (from lerobot-find-cameras)
+    camera_path_1 = "/dev/video1"
+    camera_path_2 = "/dev/video3"
     
     print(f"\nCamera Configuration:")
-    print(f"  Camera 1 Index: {camera_index_1}")
-    print(f"  Camera 2 Index: {camera_index_2}")
-    print(f"  Resolution: {width}x{height}")
-    print(f"  FPS: {fps}")
-    print(f"  Color Mode: RGB")
+    print(f"  Camera 1 Path: {camera_path_1}")
+    print(f"  Camera 2 Path: {camera_path_2}")
     
-    # Create configs for both cameras
-    config1 = OpenCVCameraConfig(
-        index_or_path=camera_index_1,
-        fps=fps,
-        width=width,
-        height=height,
-        color_mode=ColorMode.RGB,
-        rotation=Cv2Rotation.NO_ROTATION
-    )
+    # Connect to first camera
+    print(f"\nConnecting to camera 1 ({camera_path_1})...")
+    camera1, config1, shape1 = try_connect_camera(camera_path_1, "Camera 1", rotation=Cv2Rotation.NO_ROTATION)
     
-    config2 = OpenCVCameraConfig(
-        index_or_path=camera_index_2,
-        fps=fps,
-        width=width,
-        height=height,
-        color_mode=ColorMode.RGB,
-        rotation=Cv2Rotation.NO_ROTATION
-    )
-    
-    # Connect to both cameras
-    print(f"\nConnecting to camera {camera_index_1}...")
-    try:
-        camera1 = OpenCVCamera(config1)
-        camera1.connect()
-        print("✓ Camera 1 connected successfully!")
-    except Exception as e:
-        print(f"✗ Failed to connect to camera 1: {e}")
-        print("\nTroubleshooting:")
-        print("1. Run: python -m lerobot.find_cameras opencv")
-        print("2. Check camera indices")
+    if camera1 is None:
+        print(f"\n✗ Failed to connect to camera 1")
+        print("Troubleshooting:")
+        print("1. Check camera permissions: ls -l /dev/video*")
+        print("2. Add your user to video group: sudo usermod -a -G video $USER")
+        print("3. Try running with sudo: sudo python test_dual_camera.py")
+        print("4. Check if camera is in use: lsof /dev/video1")
         return
     
-    print(f"\nConnecting to camera {camera_index_2}...")
-    try:
-        camera2 = OpenCVCamera(config2)
-        camera2.connect()
-        print("✓ Camera 2 connected successfully!")
-    except Exception as e:
-        print(f"✗ Failed to connect to camera 2: {e}")
+    # Connect to second camera (with 180 degree rotation since it's upside down)
+    print(f"\nConnecting to camera 2 ({camera_path_2})...")
+    camera2, config2, shape2 = try_connect_camera(camera_path_2, "Camera 2", rotation=Cv2Rotation.ROTATE_180)
+    
+    if camera2 is None:
+        print(f"\n✗ Failed to connect to camera 2")
+        print("Will continue with single camera for testing...")
         camera1.disconnect()
-        print("\nNote: Only one camera detected. Adjust camera_index_2 if needed.")
         return
+    
+    # Determine display dimensions
+    height = shape1[0]  # Use first camera's height
+    width = shape1[1]
+    
+    print(f"\nDisplay configuration:")
+    print(f"  Frame size: {width}x{height}")
+    print(f"  Combined size: {width*2}x{height}")
     
     # Create display window
     window_name = "Dual Camera View (Press ESC to exit)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    # Make window twice as wide to fit both cameras side by side
     cv2.resizeWindow(window_name, width * 2, height)
     
     print("\n📹 Displaying dual camera feed...")
@@ -111,6 +150,13 @@ def main():
                 print("Warning: Failed to read from one or both cameras")
                 time.sleep(0.1)
                 continue
+            
+            # Resize frames if they don't match (in case cameras have different resolutions)
+            if frame1.shape != frame2.shape:
+                target_height = min(frame1.shape[0], frame2.shape[0])
+                target_width = min(frame1.shape[1], frame2.shape[1])
+                frame1 = cv2.resize(frame1, (target_width, target_height))
+                frame2 = cv2.resize(frame2, (target_width, target_height))
             
             # Convert RGB to BGR for OpenCV display
             frame1_bgr = cv2.cvtColor(frame1, cv2.COLOR_RGB2BGR)
