@@ -25,9 +25,10 @@ Controls:
     RB                  Switch to ARM mode
     LB                  Switch to MOTOR mode
     RB + LB             IDLE (stop everything)
-    A / B               Preset → HOME
-    X                   Preset → READY
-    Y                   Preset → VERTICAL
+    A                   Preset → HOME
+    B                   Preset → MOVEMENT
+    X                   Preset → DROP
+    Y                   Preset → GRAB
     Start               Exit
 """
 
@@ -221,9 +222,10 @@ JOINT_KEYS = [
 ]
 
 PRESET_POSITIONS = {
-    "home": np.array([0.0, -108.0, 95.0, 55.0, -90.0, 0.0], dtype=np.float32),
-    "ready": np.array([0.0, 0.0, 0.0, 0.0, -90.0, 0.0], dtype=np.float32),
-    "vertical": np.array([0.0, 0.0, -90.0, 0.0, -90.0, 0.0], dtype=np.float32),
+    "home":     np.array([0.0,   -108.0,  95.0,   55.0,   -90.0,  0.0],  dtype=np.float32),
+    "movement": np.array([0.3,   -85.7,   95.0,  -23.0,   -90.0,  0.0],  dtype=np.float32),
+    "grab":     np.array([-4.4,   42.9,    3.0,   49.0,   -90.0, 70.0],  dtype=np.float32),
+    "drop":     np.array([0.7,    -3.9,  -72.2, -107.6,   -90.0, 0.0],  dtype=np.float32),
 }
 
 SERVO_CENTER = 2048
@@ -419,15 +421,18 @@ class SO101GamepadClient:
         if self.joystick.get_button(self.BTN_START):
             self.running = False
             return None
-        if self.joystick.get_button(self.BTN_A) or self.joystick.get_button(self.BTN_B):
+        if self.joystick.get_button(self.BTN_A):
             print("→ Moving to HOME position")
             return "preset_home"
+        if self.joystick.get_button(self.BTN_B):
+            print("→ Moving to MOVEMENT position")
+            return "preset_movement"
         if self.joystick.get_button(self.BTN_X):
-            print("→ Moving to READY position")
-            return "preset_ready"
+            print("→ Moving to DROP position")
+            return "preset_drop"
         if self.joystick.get_button(self.BTN_Y):
-            print("→ Moving to VERTICAL position")
-            return "preset_vertical"
+            print("→ Moving to GRAB position")
+            return "preset_grab"
 
         # ── Motor mode ────────────────────────────────────────────
         if self.mode == "motor":
@@ -520,7 +525,7 @@ class SO101GamepadClient:
         print("  RT:                  Close gripper")
         print("  ── General ───────────────────────────────────────────")
         print("  RB + LB:             Force idle (stop everything)")
-        print("  A / B:               HOME   X: READY   Y: VERTICAL")
+        print("  A: HOME  B: MOVEMENT  X: DROP  Y: GRAB")
         print("  Start:               Exit")
         print("\nℹ️  Tap RB → ARM mode  |  Tap LB → MOTOR mode  |  Tap again → IDLE")
         print("Starting in 3 seconds…\n")
