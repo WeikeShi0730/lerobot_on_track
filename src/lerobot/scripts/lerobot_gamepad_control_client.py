@@ -377,6 +377,14 @@ class SO101GamepadClient:
         send_msg(self.sock, {"type": "action", "action": action_dict})
         self.stats.record_send(time.perf_counter() - t0)
 
+    def _send_preset(self, position: np.ndarray) -> None:
+        """Like _send_position but tags the message as a preset so the server
+        uses two-phase execution (proximal joints first, then wrist/gripper)."""
+        action_dict = {key: float(position[i]) for i, key in enumerate(JOINT_KEYS)}
+        t0 = time.perf_counter()
+        send_msg(self.sock, {"type": "action", "preset": True, "action": action_dict})
+        self.stats.record_send(time.perf_counter() - t0)
+
     def _send_motor(self, motor1: float, motor2: float) -> None:
         """Send motor command. Values -1.0 to 1.0 (negative = backward, 0 = stop)."""
         send_msg(self.sock, {"type": "motor", "motor1": float(motor1), "motor2": float(motor2)})
@@ -566,7 +574,7 @@ class SO101GamepadClient:
                     preset_name = action.removeprefix("preset_")
                     target = PRESET_POSITIONS.get(preset_name, PRESET_POSITIONS["home"]).copy()
                     target = np.clip(target, self.joint_limits_lower, self.joint_limits_upper)
-                    self._send_position(target)
+                    self._send_preset(target)
                     self.current_position = target
                     time.sleep(0.5)
                     continue
