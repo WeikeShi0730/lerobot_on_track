@@ -186,8 +186,8 @@ class MotorController:
         self._drive(self.motor2, m2)
 
     @staticmethod
-    def _drive(motor: "Motor", value: float) -> None:
-        value = max(-1.0, min(1.0, value))   # clamp
+    def _drive(motor, value: float) -> None:
+        value = max(-1.0, min(1.0, value)) # clamp
         if abs(value) < 0.01:
             motor.stop()
         elif value > 0:
@@ -212,6 +212,33 @@ JOINT_KEYS = [
     "wrist_roll.pos",
     "gripper.pos",
 ]
+
+# For preset moves, drive proximal joints first (shoulder/elbow) so the arm
+# is in a safe configuration before the wrist and gripper move.
+# Continuous control sends all joints together as usual.
+PRESET_PHASE1 = {"shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos"}
+PRESET_PHASE2 = {"wrist_flex.pos", "wrist_roll.pos", "gripper.pos"}
+PRESET_PHASE_PAUSE = 0.8   # seconds to wait between phase 1 and phase 2
+
+
+def send_action_two_phase(robot, action_dict: dict) -> float:
+    """
+    Execute a preset action in two phases to avoid collision:
+      Phase 1 — shoulder_pan, shoulder_lift, elbow_flex
+      Phase 2 — wrist_flex, wrist_roll, gripper  (after phase_pause seconds)
+
+    Returns total wall time taken (for stats).
+    """
+    t0 = time.perf_counter()
+    phase1 = {k: v for k, v in action_dict.items() if k in PRESET_PHASE1}
+    phase2 = {k: v for k, v in action_dict.items() if k in PRESET_PHASE2}
+    if phase1:
+        robot.send_action(phase1)
+    if phase1 and phase2:
+        time.sleep(PRESET_PHASE_PAUSE)
+    if phase2:
+        robot.send_action(phase2)
+    return time.perf_counter() - t0
 
 
 def connect_robot_arm(port: str, robot_id: str):
@@ -269,18 +296,26 @@ def handle_client(conn: socket.socket, robot_arm, motors: "MotorController | Non
                 print(f"[server] mode_request '{requested}' → {'granted' if ok else f'denied ({reason})'}")
 
             # ── action (arm) ─────────────────────────────────────────────
-            if mtype == "action":
+            elif mtype == "action":
                 if robot_arm is not None:
-                    action_dict: dict = msg["action"] # {joint_key: float, …}
+                    action_dict: dict = msg["action"]   # {joint_key: float, …}
+                    is_preset: bool   = msg.get("preset", False)
                     recv_t = time.perf_counter()
-                    t0 = time.perf_counter()
-                    robot_arm.send_action(action_dict)
+                    t0     = time.perf_counter()
+                    if is_preset:
+                        # Phase 1: shoulder_pan, shoulder_lift, elbow_flex
+                        # Phase 2: wrist_flex, wrist_roll, gripper
+                        # Pause between phases lets the arm clear collisions.
+                        send_action_two_phase(robot_arm, action_dict)
+                    else:
+                        robot_arm.send_action(action_dict)
                     exec_s = time.perf_counter() - t0
                     stats.record_action(recv_t, exec_s)
                     stats.maybe_print()
                     if verbose:
+                        kind = "preset" if is_preset else "continuous"
                         vals = [f"{action_dict.get(k, 0):.1f}" for k in JOINT_KEYS]
-                        print(f"[server] action exec={exec_s*1000:.2f}ms  pos={vals}")
+                        print(f"[server] action({kind}) exec={exec_s*1000:.2f}ms  pos={vals}")
                 else:
                     if verbose:
                         print("[server] action msg received but arm not connected — ignoring")
@@ -368,7 +403,7 @@ def main():
     else:
         robot_arm = connect_robot_arm(args.port, args.robot_id)
         if robot_arm is None:
-            print("ℹ️  Arm:    DISABLED (connection failed — motors-only mode)")
+            print("ℹ️  Arm:    DISABLED (connection failed)")
         else:
             print(f"✓  Arm:    ENABLED  ({args.port})")
 
@@ -384,8 +419,7 @@ def main():
                 m1_forward=args.m1_fwd, m1_backward=args.m1_bwd, m1_enable=args.m1_en,
                 m2_forward=args.m2_fwd, m2_backward=args.m2_bwd, m2_enable=args.m2_en,
             )
-            print(f"✓  Motors: ENABLED  (M1: IN1={args.m1_fwd}/IN2={args.m1_bwd}/ENA={args.m1_en}  "
-                  f"M2: IN3={args.m2_fwd}/IN4={args.m2_bwd}/ENB={args.m2_en})")
+            print(f"✓  Motors: ENABLED")
         except Exception as e:
             print(f"⚠️  Motors: DISABLED (init failed: {e})")
 
