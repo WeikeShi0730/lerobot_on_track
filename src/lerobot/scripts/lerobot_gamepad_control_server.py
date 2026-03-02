@@ -218,26 +218,63 @@ JOINT_KEYS = [
 # Continuous control sends all joints together as usual.
 PRESET_PHASE1 = {"shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos"}
 PRESET_PHASE2 = {"wrist_flex.pos", "wrist_roll.pos", "gripper.pos"}
-PRESET_PHASE_PAUSE = 0.8   # seconds to wait between phase 1 and phase 2
+PRESET_PHASE_PAUSE = 0.5   # seconds to wait between phase 1 and phase 2
+
+PRESET_SPEED_DEG_PER_SEC = 50.0   # max joint speed during preset interpolation
+PRESET_STEP_HZ           = 50     # interpolation tick rate (steps per second)
 
 
 def send_action_two_phase(robot, action_dict: dict) -> float:
     """
-    Execute a preset action in two phases to avoid collision:
-      Phase 1 — shoulder_pan, shoulder_lift, elbow_flex
-      Phase 2 — wrist_flex, wrist_roll, gripper  (after phase_pause seconds)
+    Execute a preset action in two phases to avoid collision, with smooth
+    interpolation so no joint moves faster than PRESET_SPEED_DEG_PER_SEC.
+
+      Phase 1 — shoulder_pan, shoulder_lift, elbow_flex  (interpolated)
+      Phase 2 — wrist_flex, wrist_roll, gripper          (interpolated, after pause)
 
     Returns total wall time taken (for stats).
     """
     t0 = time.perf_counter()
-    phase1 = {k: v for k, v in action_dict.items() if k in PRESET_PHASE1}
-    phase2 = {k: v for k, v in action_dict.items() if k in PRESET_PHASE2}
-    if phase1:
-        robot.send_action(phase1)
-    if phase1 and phase2:
+
+    def interpolate_phase(phase_keys: set) -> None:
+        phase_target = {k: v for k, v in action_dict.items() if k in phase_keys}
+        if not phase_target:
+            return
+
+        # Read current joint positions from the robot.
+        try:
+            obs = robot.get_observation()
+            phase_start = {k: float(obs[k]) for k in phase_target if k in obs}
+        except Exception:
+            phase_start = {}
+
+        # Fall back to jumping straight to target if observation unavailable.
+        if not phase_start:
+            robot.send_action(phase_target)
+            return
+
+        # Number of steps driven by the largest joint displacement.
+        step_dt   = 1.0 / PRESET_STEP_HZ
+        max_delta = max(abs(phase_target[k] - phase_start[k]) for k in phase_target)
+        min_steps = max(1, int(np.ceil(max_delta / (PRESET_SPEED_DEG_PER_SEC * step_dt))))
+
+        for i in range(1, min_steps + 1):
+            alpha = i / min_steps
+            step_cmd = {
+                k: phase_start[k] + alpha * (phase_target[k] - phase_start[k])
+                for k in phase_target
+            }
+            robot.send_action(step_cmd)
+            time.sleep(step_dt)
+
+    phase1_keys = {k for k in action_dict if k in PRESET_PHASE1}
+    phase2_keys = {k for k in action_dict if k in PRESET_PHASE2}
+
+    interpolate_phase(phase1_keys)
+    if phase1_keys and phase2_keys:
         time.sleep(PRESET_PHASE_PAUSE)
-    if phase2:
-        robot.send_action(phase2)
+    interpolate_phase(phase2_keys)
+
     return time.perf_counter() - t0
 
 

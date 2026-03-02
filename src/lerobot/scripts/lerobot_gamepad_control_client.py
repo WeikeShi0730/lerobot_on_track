@@ -224,7 +224,7 @@ JOINT_KEYS = [
 PRESET_POSITIONS = {
     "home":     np.array([0.0,   -108.0,  95.0,   55.0,   -90.0,  0.0],  dtype=np.float32),
     "movement": np.array([0.3,   -85.7,   95.0,  -23.0,   -90.0,  0.0],  dtype=np.float32),
-    "grab":     np.array([-4.4,   42.9,    3.0,   49.0,   -90.0, 70.0],  dtype=np.float32),
+    "grab":     np.array([-12.3,   60.9,  -38.3,  73.0,   -90.0,  64.1],  dtype=np.float32),
     "drop":     np.array([0.7,    -3.9,  -72.2, -107.6,   -90.0, 0.0],  dtype=np.float32),
 }
 
@@ -375,6 +375,14 @@ class SO101GamepadClient:
         action_dict = {key: float(position[i]) for i, key in enumerate(JOINT_KEYS)}
         t0 = time.perf_counter()
         send_msg(self.sock, {"type": "action", "action": action_dict})
+        self.stats.record_send(time.perf_counter() - t0)
+
+    def _send_preset(self, position: np.ndarray) -> None:
+        """Like _send_position but tags the message as a preset so the server
+        uses two-phase execution (proximal joints first, then wrist/gripper)."""
+        action_dict = {key: float(position[i]) for i, key in enumerate(JOINT_KEYS)}
+        t0 = time.perf_counter()
+        send_msg(self.sock, {"type": "action", "preset": True, "action": action_dict})
         self.stats.record_send(time.perf_counter() - t0)
 
     def _send_motor(self, motor1: float, motor2: float) -> None:
@@ -528,8 +536,8 @@ class SO101GamepadClient:
         print("  A: HOME  B: MOVEMENT  X: DROP  Y: GRAB")
         print("  Start:               Exit")
         print("\nℹ️  Tap RB → ARM mode  |  Tap LB → MOTOR mode  |  Tap again → IDLE")
-        print("Starting in 3 seconds…\n")
-        time.sleep(3)
+        print("Starting in 1 second…\n")
+        time.sleep(1)
 
         try:
             while self.running:
@@ -566,7 +574,7 @@ class SO101GamepadClient:
                     preset_name = action.removeprefix("preset_")
                     target = PRESET_POSITIONS.get(preset_name, PRESET_POSITIONS["home"]).copy()
                     target = np.clip(target, self.joint_limits_lower, self.joint_limits_upper)
-                    self._send_position(target)
+                    self._send_preset(target)
                     self.current_position = target
                     time.sleep(0.5)
                     continue

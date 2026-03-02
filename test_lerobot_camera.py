@@ -24,6 +24,15 @@ def try_connect_camera(device_path, label="Camera", rotation=Cv2Rotation.NO_ROTA
             "color_mode": ColorMode.RGB,
             "rotation": rotation
         },
+        # try with 1280x720 @ 10fps (higher resolution)
+        {
+            "index_or_path": device_path,
+            "fps": 10,
+            "width": 1280,
+            "height": 720,
+            "color_mode": ColorMode.RGB,
+            "rotation": rotation
+        },
         # Try with 640x480 @ 30fps
         {
             "index_or_path": device_path,
@@ -82,8 +91,8 @@ def main():
     print(f"Platform: {system}")
     
     # Camera device paths (from lerobot-find-cameras)
-    camera_path_1 = "/dev/video1"
-    camera_path_2 = "/dev/video3"
+    camera_path_1 = "/dev/video0"
+    camera_path_2 = "/dev/video2"
     
     print(f"\nCamera Configuration:")
     print(f"  Camera 1 Path: {camera_path_1}")
