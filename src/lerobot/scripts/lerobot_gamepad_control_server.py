@@ -162,13 +162,13 @@ class MotorController:
     def __init__(
         self,
         # Motor 1 pins
-        m1_forward: int = 17,
-        m1_backward: int = 18,
-        m1_enable: int = 25,
+        m1_forward: int = 5,
+        m1_backward: int = 6,
+        m1_enable: int = 13,
         # Motor 2 pins
-        m2_forward: int = 22,
-        m2_backward: int = 23,
-        m2_enable: int = 24,
+        m2_forward: int = 16,
+        m2_backward: int = 1,
+        m2_enable: int = 12,
     ):
         if not MOTORS_AVAILABLE:
             raise RuntimeError("gpiozero/lgpio not available — cannot create MotorController")
@@ -421,12 +421,12 @@ def main():
     parser.add_argument("--robot-id",  default="so101_follower")
     # Motors
     parser.add_argument("--no-motors", action="store_true",     help="Disable motors (arm only)")
-    parser.add_argument("--m1-fwd",    type=int, default=17,    help="Motor 1 forward GPIO / IN1 (default: 17)")
-    parser.add_argument("--m1-bwd",    type=int, default=18,    help="Motor 1 backward GPIO / IN2 (default: 18)")
-    parser.add_argument("--m1-en",     type=int, default=25,    help="Motor 1 enable GPIO / ENA (default: 25)")
-    parser.add_argument("--m2-fwd",    type=int, default=22,    help="Motor 2 forward GPIO / IN3 (default: 22)")
-    parser.add_argument("--m2-bwd",    type=int, default=23,    help="Motor 2 backward GPIO / IN4 (default: 23)")
-    parser.add_argument("--m2-en",     type=int, default=24,    help="Motor 2 enable GPIO / ENB (default: 24)")
+    # parser.add_argument("--m1-fwd",    type=int, default=17,    help="Motor 1 forward GPIO / IN1 (default: 17)")
+    # parser.add_argument("--m1-bwd",    type=int, default=18,    help="Motor 1 backward GPIO / IN2 (default: 18)")
+    # parser.add_argument("--m1-en",     type=int, default=25,    help="Motor 1 enable GPIO / ENA (default: 25)")
+    # parser.add_argument("--m2-fwd",    type=int, default=22,    help="Motor 2 forward GPIO / IN3 (default: 22)")
+    # parser.add_argument("--m2-bwd",    type=int, default=23,    help="Motor 2 backward GPIO / IN4 (default: 23)")
+    # parser.add_argument("--m2-en",     type=int, default=24,    help="Motor 2 enable GPIO / ENB (default: 24)")
     args = parser.parse_args()
 
     print("\n" + "=" * 55)
@@ -453,8 +453,8 @@ def main():
     else:
         try:
             motors = MotorController(
-                m1_forward=args.m1_fwd, m1_backward=args.m1_bwd, m1_enable=args.m1_en,
-                m2_forward=args.m2_fwd, m2_backward=args.m2_bwd, m2_enable=args.m2_en,
+                # m1_forward=args.m1_fwd, m1_backward=args.m1_bwd, m1_enable=args.m1_en,
+                # m2_forward=args.m2_fwd, m2_backward=args.m2_bwd, m2_enable=args.m2_en,
             )
             print(f"✓  Motors: ENABLED")
         except Exception as e:
