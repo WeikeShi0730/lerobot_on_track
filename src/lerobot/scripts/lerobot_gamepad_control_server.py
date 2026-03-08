@@ -7,19 +7,19 @@ over TCP and drives the SO-101 follower arm.
 
 Usage:
     # Both arm and motors (default)
-    lerobot-gamepad-control-server --host=192.168.2.72 --tcp-port=2222 --port=/dev/ttyACM0 --robot-id=so101_follower
+    lerobot-gamepad-control-server --host=192.168.2.72 --tcp-port=2222 --arm-port=/dev/ttyACM0 --robot-id=so101_follower
 
     # Arm only
-    lerobot-gamepad-control-server --no-motors --host=192.168.2.72 --tcp-port=2222 --port=/dev/ttyACM0 --robot-id=so101_follower
+    lerobot-gamepad-control-server --no-motors --host=192.168.2.72 --tcp-port=2222 --arm-port=/dev/ttyACM0 --robot-id=so101_follower
 
     # Motors only
-    lerobot-gamepad-control-server --no-arm --host=192.168.2.72 --tcp-port=2222 --port=/dev/ttyACM0 --robot-id=so101_follower
+    lerobot-gamepad-control-server --no-arm --host=192.168.2.72 --tcp-port=2222 --arm-port=/dev/ttyACM0 --robot-id=so101_follower
 
     # Custom serial port or TCP port
-    lerobot-gamepad-control-server --port /dev/ttyACM1 --host=192.168.2.72 --tcp-port=5555 --robot-id=so101_follower
+    lerobot-gamepad-control-server --host=192.168.2.72 --tcp-port=5555 --arm-port=/dev/ttyACM1 --robot-id=so101_follower
 
     # Record a dataset while teleoperating (arm only, motors are not recorded)
-    lerobot-gamepad-control-server --host=192.168.2.72 --tcp-port=2222 --port=/dev/ttyACM0 --robot-id=so101_follower \
+    lerobot-gamepad-control-server --host=192.168.2.72 --tcp-port=2222 --arm-port=/dev/ttyACM0 --robot-id=so101_follower \
         --repo-id=${HF_USER}/sock-grab \
         --task="Grab the sock" \
         --num-episodes=10 \
@@ -241,79 +241,60 @@ JOINT_KEYS = [
     "gripper.pos",
 ]
 
-# For preset moves, drive proximal joints first (shoulder/elbow) so the arm
-# is in a safe configuration before the wrist and gripper move.
-# Continuous control sends all joints together as usual.
-PRESET_PHASE1 = {"shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos"}
-PRESET_PHASE2 = {"wrist_flex.pos", "wrist_roll.pos", "gripper.pos"}
-PRESET_PHASE_PAUSE = 0.5   # seconds to wait between phase 1 and phase 2
-
 PRESET_SPEED_DEG_PER_SEC = 50.0   # max joint speed during preset interpolation
 PRESET_STEP_HZ           = 50     # interpolation tick rate (steps per second)
 
 
-def send_action_two_phase(robot, action_dict: dict) -> float:
+def send_action_preset(robot_arm, action_dict: dict) -> float:
     """
-    Execute a preset action in two phases to avoid collision, with smooth
-    interpolation so no joint moves faster than PRESET_SPEED_DEG_PER_SEC.
-
-      Phase 1 — shoulder_pan, shoulder_lift, elbow_flex  (interpolated)
-      Phase 2 — wrist_flex, wrist_roll, gripper          (interpolated, after pause)
+    Execute a preset action with smooth interpolation so no joint moves faster than PRESET_SPEED_DEG_PER_SEC.
 
     Returns total wall time taken (for stats).
     """
     t0 = time.perf_counter()
 
-    def interpolate_phase(phase_keys: set) -> None:
-        phase_target = {k: v for k, v in action_dict.items() if k in phase_keys}
-        if not phase_target:
-            return
+    
+    phase_target = {k: v for k, v in action_dict.items()}
+    if not phase_target:
+        return
 
-        # Read current joint positions from the robot.
-        try:
-            obs = robot.get_observation()
-            phase_start = {k: float(obs[k]) for k in phase_target if k in obs}
-        except Exception:
-            phase_start = {}
+    # Read current joint positions from the robot_arm.
+    try:
+        obs = robot_arm.get_observation()
+        phase_start = {k: float(obs[k]) for k in phase_target if k in obs}
+    except Exception:
+        phase_start = {}
 
-        # Fall back to jumping straight to target if observation unavailable.
-        if not phase_start:
-            robot.send_action(phase_target)
-            return
+    # Fall back to jumping straight to target if observation unavailable.
+    if not phase_start:
+        robot_arm.send_action(phase_target)
+        return
 
-        # Number of steps driven by the largest joint displacement.
-        step_dt   = 1.0 / PRESET_STEP_HZ
-        max_delta = max(abs(phase_target[k] - phase_start[k]) for k in phase_target)
-        min_steps = max(1, int(np.ceil(max_delta / (PRESET_SPEED_DEG_PER_SEC * step_dt))))
+    # Number of steps driven by the largest joint displacement.
+    step_dt   = 1.0 / PRESET_STEP_HZ
+    max_delta = max(abs(phase_target[k] - phase_start[k]) for k in phase_target)
+    min_steps = max(1, int(np.ceil(max_delta / (PRESET_SPEED_DEG_PER_SEC * step_dt))))
 
-        for i in range(1, min_steps + 1):
-            alpha = i / min_steps
-            step_cmd = {
-                k: phase_start[k] + alpha * (phase_target[k] - phase_start[k])
-                for k in phase_target
-            }
-            robot.send_action(step_cmd)
-            time.sleep(step_dt)
-
-    phase1_keys = {k for k in action_dict if k in PRESET_PHASE1}
-    phase2_keys = {k for k in action_dict if k in PRESET_PHASE2}
-
-    interpolate_phase(phase1_keys)
-    if phase1_keys and phase2_keys:
-        time.sleep(PRESET_PHASE_PAUSE)
-    interpolate_phase(phase2_keys)
+    for i in range(1, min_steps + 1):
+        alpha = i / min_steps
+        step_cmd = {
+            k: phase_start[k] + alpha * (phase_target[k] - phase_start[k])
+            for k in phase_target
+        }
+        robot_arm.send_action(step_cmd)
+        time.sleep(step_dt)
 
     return time.perf_counter() - t0
 
 
-def connect_robot_arm(port: str, robot_id: str):
+def connect_robot_arm(arm_port: str, robot_id: str):
     """Connect to SO-101 arm. Returns robot instance or None on failure."""
     if not ARM_AVAILABLE:
         print("ℹ️  lerobot not available — arm disabled")
         return None
     try:
-        print(f"  Connecting to SO-101 on {port} (id={robot_id}) …")
-        config = SO101FollowerConfig(port=port, id=robot_id)
+        print(f"  Connecting to SO-101 on {arm_port} (id={robot_id}) …")
+        config = SO101FollowerConfig(port=arm_port, id=robot_id)
         robot_arm = SO101Follower(config)
         robot_arm.connect()
         print("✓ Arm connected.")
@@ -600,7 +581,7 @@ def handle_client(
                         # Phase 1: shoulder_pan, shoulder_lift, elbow_flex
                         # Phase 2: wrist_flex, wrist_roll, gripper
                         # Pause between phases lets the arm clear collisions.
-                    send_action_two_phase(robot_arm, action_dict)
+                    send_action_preset(robot_arm, action_dict)
                 else:
                     robot_arm.send_action(action_dict)
                 exec_s = time.perf_counter() - t0
@@ -737,7 +718,7 @@ def main():
     parser.add_argument("--verbose",   action="store_true",     help="Print every action/motor command")
     # Arm
     parser.add_argument("--no-arm",    action="store_true",     help="Disable arm (motors only)")
-    parser.add_argument("--port",      default="/dev/ttyACM0",  help="Serial port for SO-101 (default: /dev/ttyACM0)")
+    parser.add_argument("--arm-port",   default="/dev/ttyACM0",  help="Serial port for SO-101 (default: /dev/ttyACM0)")
     parser.add_argument("--robot-id",  default="so101_follower")
     # Motors
     parser.add_argument("--no-motors", action="store_true",     help="Disable motors (arm only)")
@@ -775,11 +756,11 @@ def main():
     if args.no_arm:
         print("ℹ️  Arm:    DISABLED (--no-arm)")
     else:
-        robot_arm = connect_robot_arm(args.port, args.robot_id)
+        robot_arm = connect_robot_arm(args.arm_port, args.robot_id)
         if robot_arm is None:
             print("ℹ️  Arm:    DISABLED (connection failed)")
         else:
-            print(f"✓  Arm:    ENABLED  ({args.port})")
+            print(f"✓  Arm:    ENABLED  ({args.arm_port})")
 
     # ── Motors ────────────────────────────────────────────────
     motors = None
