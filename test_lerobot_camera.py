@@ -24,25 +24,7 @@ def try_connect_camera(device_path, label="Camera", rotation=Cv2Rotation.NO_ROTA
             "color_mode": ColorMode.RGB,
             "rotation": rotation
         },
-        # try with 1280x720 @ 10fps (higher resolution)
-        {
-            "index_or_path": device_path,
-            "fps": 10,
-            "width": 1280,
-            "height": 720,
-            "color_mode": ColorMode.RGB,
-            "rotation": rotation
-        },
         # Try with 640x480 @ 30fps
-        {
-            "index_or_path": device_path,
-            "fps": 30,
-            "width": 640,
-            "height": 480,
-            "color_mode": ColorMode.RGB,
-            "rotation": rotation
-        },
-        # Try with 640x480 @ 15fps
         {
             "index_or_path": device_path,
             "fps": 15,
@@ -51,15 +33,15 @@ def try_connect_camera(device_path, label="Camera", rotation=Cv2Rotation.NO_ROTA
             "color_mode": ColorMode.RGB,
             "rotation": rotation
         },
-        # Try with 320x240 @ 30fps (lower resolution)
+        # try with 1280x720 @ 10fps (higher resolution)
         {
             "index_or_path": device_path,
-            "fps": 30,
-            "width": 320,
-            "height": 240,
+            "fps": 10,
+            "width": 1280,
+            "height": 720,
             "color_mode": ColorMode.RGB,
             "rotation": rotation
-        },
+        }
     ]
     
     for i, config_dict in enumerate(configs):
