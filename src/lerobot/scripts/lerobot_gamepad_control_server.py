@@ -318,72 +318,134 @@ def get_observation_dict(robot) -> dict:
 # Dataset recording helpers
 # ──────────────────────────────────────────────────────────────
 
+def _parse_camera_spec(camera_spec: str) -> dict:
+    """
+    Parse lerobot-style camera spec into {name: {key: value}} dict.
+
+    Input format (same as lerobot-record --robot.cameras):
+        { front: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30},
+          base:  {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30}}
+
+    Strategy: strip braces/whitespace, split on camera boundaries, then split
+    each camera's key-value pairs. No regex, no JSON conversion needed.
+    """
+    spec = camera_spec.strip().strip("{}")
+    cameras = {}
+
+    # Split into per-camera blocks by finding "name: {....}" segments
+    # We walk character-by-character to split on top-level commas (outside braces)
+    blocks = []
+    depth = 0
+    current = ""
+    for ch in spec:
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            blocks.append(current.strip())
+            current = ""
+        else:
+            current += ch
+    if current.strip():
+        blocks.append(current.strip())
+
+    for block in blocks:
+        # Split "name: { key: val, key: val }" into name and inner dict
+        colon_pos = block.index(":")
+        name = block[:colon_pos].strip().strip("\"'")
+        inner = block[colon_pos+1:].strip().strip("{}")
+
+        # Parse inner key:value pairs (same depth-aware split)
+        cfg = {}
+        pairs = []
+        depth = 0
+        current = ""
+        for ch in inner:
+            if ch == "{": depth += 1
+            elif ch == "}": depth -= 1
+            if ch == "," and depth == 0:
+                pairs.append(current.strip())
+                current = ""
+            else:
+                current += ch
+        if current.strip():
+            pairs.append(current.strip())
+
+        for pair in pairs:
+            if ":" not in pair:
+                continue
+            k, v = pair.split(":", 1)
+            cfg[k.strip().strip("\"'")] = v.strip().strip("\"'")
+
+        cameras[name] = cfg
+
+    return cameras
+
+
 def connect_cameras(camera_spec: str) -> dict:
     """
-    Parse "name:/dev/videoN,name2:/dev/videoM" and connect each camera.
-    Returns {name: OpenCVCamera}. Empty dict if recording not available.
+    Parse lerobot-style camera spec and connect each OpenCVCamera.
+    Returns {name: OpenCVCamera}.
 
-    We intentionally omit width/height from OpenCVCameraConfig — lerobot's
-    OpenCV wrapper raises an error if it can't set the exact resolution via
-    ioctl, which fails on many /dev/videoN devices even when the camera
-    actually works fine. Resolution is captured from the first real frame.
+    Accepts the same format as lerobot-record --robot.cameras:
+        "{ front: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30},
+           base:  {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30}}"
     """
     cameras = {}
     if not camera_spec or not RECORDING_AVAILABLE:
         return cameras
-    for part in camera_spec.split(","):
-        part = part.strip()
-        if ":" not in part:
-            continue
-        name, path = part.split(":", 1)
-        name = name.strip()
+
+    try:
+        parsed = _parse_camera_spec(camera_spec)
+    except Exception as e:
+        print(f"⚠️  Could not parse --cameras spec: {e}")
+        return cameras
+
+    for name, cfg_dict in parsed.items():
         try:
-            # Prefer integer index — more reliable with lerobot's OpenCV wrapper.
-            # Accept both "0" and "/dev/video0" style paths.
-            path = path.strip()
-            if path.lstrip("-").isdigit():
-                index = int(path)
-            elif path.startswith("/dev/video"):
-                # Extract the integer from /dev/videoN
-                index = int(path.replace("/dev/video", ""))
+            raw_path = cfg_dict.get("index_or_path", "0")
+            # Convert /dev/videoN → integer index (most reliable with lerobot)
+            if str(raw_path).lstrip("-").isdigit():
+                index = int(raw_path)
+            elif str(raw_path).startswith("/dev/video"):
+                index = int(raw_path.replace("/dev/video", ""))
             else:
-                index = path   # pass through as-is (e.g. a named pipe or USB path)
-            cfg = OpenCVCameraConfig(index_or_path=index)
+                index = raw_path
+
+            kwargs = {"index_or_path": index}
+            if "width"  in cfg_dict: kwargs["width"]  = int(cfg_dict["width"])
+            if "height" in cfg_dict: kwargs["height"] = int(cfg_dict["height"])
+            if "fps"    in cfg_dict: kwargs["fps"]    = int(cfg_dict["fps"])
+
+            cfg = OpenCVCameraConfig(**kwargs)
             cam = OpenCVCamera(cfg)
             cam.connect()
             cameras[name] = cam
-            print(f"✓ Camera '{name}' connected ({path})")
+            print(f"✓ Camera '{name}' connected ({raw_path})")
         except Exception as e:
             print(f"⚠️  Camera '{name}' failed: {e}")
     return cameras
 
 
 def build_dataset(repo_id: str, fps: int, cameras: dict) -> "LeRobotDataset | None":
-    """Create a fresh LeRobotDataset with joint + camera features."""
+    """Create or resume a LeRobotDataset. repo_id must already be clean."""
     if not RECORDING_AVAILABLE:
         return None
     try:
-        import os, re, shutil
-        # Expand shell env vars (e.g. ${HF_USER}/sock-grab)
-        repo_id = os.path.expandvars(repo_id)
-        # Strip ANSI escape codes (e.g. from coloured CLI output captured in HF_USER)
-        repo_id = re.sub(r'\x1b\[[0-9;]*m', '', repo_id)
-        # Strip any surrounding whitespace
-        repo_id = repo_id.strip()
-
-        if "/" not in repo_id:
-            raise ValueError(
-                f"repo_id must be 'username/dataset-name', got: '{repo_id}'\n"
-                f"  Tip: export HF_USER=$(hf auth whoami | awk -F': *' 'NR==1 {{print $2}}')"
-            )
-
-        # Store dataset locally under ~/.cache/huggingface/lerobot/
+        import shutil
         local_root = Path.home() / ".cache" / "huggingface" / "lerobot" / repo_id
+        meta_file  = local_root / "meta" / "info.json"
 
-        # Remove stale directory from a previous failed run
         if local_root.exists():
-            print(f"  Removing existing dataset directory: {local_root}")
-            shutil.rmtree(local_root)
+            if meta_file.exists():
+                print(f"  Resuming existing dataset at {local_root} …")
+                ds = LeRobotDataset(repo_id=repo_id, root=local_root)
+                print(f"✓ Dataset '{repo_id}' resumed ({ds.num_episodes} existing episodes)")
+                return ds
+            else:
+                print(f"  Removing incomplete dataset directory: {local_root}")
+                shutil.rmtree(local_root)
 
         features = {}
         for k in JOINT_KEYS:
@@ -395,7 +457,7 @@ def build_dataset(repo_id: str, fps: int, cameras: dict) -> "LeRobotDataset | No
                 "names": ["height", "width", "channel"],
             }
         ds = LeRobotDataset.create(repo_id=repo_id, fps=fps, root=local_root, features=features)
-        print(f"✓ Dataset '{repo_id}' ready  (local: {local_root})")
+        print(f"✓ Dataset '{repo_id}' created  (local: {local_root})")
         return ds
     except Exception as e:
         print(f"⚠️  Dataset creation failed: {e}")
@@ -747,7 +809,19 @@ def main():
                         help="Skip uploading dataset to HuggingFace Hub")
     args = parser.parse_args()
 
-    print("\n" + "=" * 55)
+    # Expand and validate repo_id once, up front
+    if args.repo_id:
+        import os
+        args.repo_id = os.path.expandvars(args.repo_id).strip()
+        if "/" not in args.repo_id:
+            parser.error(
+                f"--repo-id must be 'username/dataset-name', got: '{args.repo_id}'\n"
+                f"  Make sure HF_USER is set: export HF_USER=$(hf auth whoami | awk -F': *' 'NR==1 {{print $2}}')"
+            )
+        if not args.task:
+            parser.error("--task is required when --repo-id is given, e.g. --task=\"Grab the sock\"")
+
+
     print("  SO-101 + Motor TCP Server")
     print("=" * 55)
 
@@ -840,8 +914,6 @@ def main():
             robot_arm.disconnect()
         # ── Finalize and push dataset ─────────────────────────
         if dataset is not None:
-            import os, re
-            clean_repo_id = re.sub(r'\x1b\[[0-9;]*m', '', os.path.expandvars(args.repo_id)).strip()
             print("\n[server] Finalizing dataset …")
             try:
                 dataset.finalize()
@@ -851,12 +923,12 @@ def main():
                 print("[server] Pushing to HuggingFace Hub …")
                 try:
                     dataset.push_to_hub()
-                    print(f"✓ Uploaded → https://huggingface.co/datasets/{clean_repo_id}")
+                    print(f"✓ Uploaded → https://huggingface.co/datasets/{args.repo_id}")
                 except Exception as e:
                     print(f"⚠️  Upload failed: {e}")
-                    local_root = Path.home() / ".cache" / "huggingface" / "lerobot" / clean_repo_id
+                    local_root = Path.home() / ".cache" / "huggingface" / "lerobot" / args.repo_id
                     print(f"   Push manually:")
-                    print(f"   huggingface-cli upload {clean_repo_id} {local_root} --repo-type dataset")
+                    print(f"   huggingface-cli upload {args.repo_id} {local_root} --repo-type dataset")
         if cam_buffer is not None:
             cam_buffer.stop()
         for cam in cameras.values():
