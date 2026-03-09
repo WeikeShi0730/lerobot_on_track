@@ -447,10 +447,13 @@ def build_dataset(repo_id: str, fps: int, cameras: dict) -> "LeRobotDataset | No
                 print(f"  Removing incomplete dataset directory: {local_root}")
                 shutil.rmtree(local_root)
 
-        features = {}
-        for k in JOINT_KEYS:
-            features[k] = {"dtype": "float32", "shape": (1,), "names": [k]}
-            features[f"action.{k}"] = {"dtype": "float32", "shape": (1,), "names": [k]}
+        n = len(JOINT_KEYS)
+        features = {
+            # Packed state vector (6,) — actual reported joint positions
+            "observation.state": {"dtype": "float32", "shape": (n,), "names": JOINT_KEYS},
+            # Packed action vector (6,) — commanded joint positions (what lerobot-replay reads)
+            "action":            {"dtype": "float32", "shape": (n,), "names": JOINT_KEYS},
+        }
         for name in cameras:
             features[f"observation.images.{name}"] = {
                 "dtype": "video", "shape": (480, 640, 3),
@@ -658,15 +661,22 @@ def handle_client(
                 # Only record continuous arm actions (not presets, not motor mode)
                 if record and in_episode and current_mode == "arm" and not is_preset:
                     try:
-                        # Re-use action_dict as the observation — the positions
-                        # we just commanded ARE the current target positions, and
-                        # calling get_observation() again would add another full
-                        # serial round-trip (~10-30ms) on the hot path.
-                        frame: dict = {"task": task}
-                        frame.update({k: np.array([float(action_dict.get(k, 0.0))], dtype=np.float32)
-                                      for k in JOINT_KEYS})
-                        frame.update({f"action.{k}": np.array([float(action_dict.get(k, 0.0))], dtype=np.float32)
-                                      for k in JOINT_KEYS})
+                        # action  = positions commanded by the client
+                        # observation.state = positions the arm actually reported (fresh serial read)
+                        action_vals = np.array(
+                            [float(action_dict.get(k, 0.0)) for k in JOINT_KEYS],
+                            dtype=np.float32,
+                        )
+                        raw_obs = robot_arm.get_observation()
+                        obs_vals = np.array(
+                            [float(raw_obs.get(k, 0.0)) for k in JOINT_KEYS],
+                            dtype=np.float32,
+                        )
+                        frame: dict = {
+                            "task":              task,
+                            "action":            action_vals,
+                            "observation.state": obs_vals,
+                        }
                         # Camera frames come from background buffer — never blocks
                         if cam_buffer is not None:
                             for cam_name, img in cam_buffer.get_latest().items():
