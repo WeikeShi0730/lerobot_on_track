@@ -181,43 +181,34 @@ def decode_video_frames_torchvision(
     can be adjusted during encoding to take into account decoding time and video size in bytes.
     """
     video_path = str(video_path)
-
-    # set backend
-    keyframes_only = False
-    torchvision.set_video_backend(backend)
-    if backend == "pyav":
-        keyframes_only = True  # pyav doesn't support accurate seek
-
-    # set a video stream reader
-    # TODO(rcadene): also load audio stream at the same time
-    reader = torchvision.io.VideoReader(video_path, "video")
-
     # set the first and last requested timestamps
     # Note: previous timestamps are usually loaded, since we need to access the previous key frame
     first_ts = min(timestamps)
     last_ts = max(timestamps)
-
-    # access closest key frame of the first requested frame
-    # Note: closest key frame timestamp is usually smaller than `first_ts` (e.g. key frame can be the first frame of the video)
-    # for details on what `seek` is doing see: https://pyav.basswood-io.com/docs/stable/api/container.html?highlight=inputcontainer#av.container.InputContainer.seek
-    reader.seek(first_ts, keyframes_only=keyframes_only)
-
     # load all frames until last requested frame
     loaded_frames = []
     loaded_ts = []
-    for frame in reader:
-        current_ts = frame["pts"]
-        if log_loaded_timestamps:
-            logging.info(f"frame loaded at timestamp={current_ts:.4f}")
-        loaded_frames.append(frame["data"])
-        loaded_ts.append(current_ts)
-        if current_ts >= last_ts:
-            break
 
-    if backend == "pyav":
-        reader.container.close()
+    with av.open(video_path) as container:
+        stream = container.streams.video[0]
+        # seek to closest keyframe before first_ts
+        container.seek(int(first_ts / stream.time_base), stream=stream, backward=True, any_frame=False)
 
-    reader = None
+        for packet in container.demux(stream):
+            for frame in packet.decode():
+                current_ts = float(frame.pts * stream.time_base)
+                if current_ts < first_ts - tolerance_s:
+                    continue
+                if log_loaded_timestamps:
+                    logging.info(f"frame loaded at timestamp={current_ts:.4f}")
+                img = frame.to_ndarray(format="rgb24")
+                tensor = torch.from_numpy(img).permute(2, 0, 1)  # HWC -> CHW
+                loaded_frames.append(tensor)
+                loaded_ts.append(current_ts)
+                if current_ts >= last_ts:
+                    break
+            if loaded_ts and loaded_ts[-1] >= last_ts:
+                break
 
     query_ts = torch.tensor(timestamps)
     loaded_ts = torch.tensor(loaded_ts)
