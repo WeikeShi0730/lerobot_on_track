@@ -136,9 +136,7 @@ def decode_video_frames_pyav(
     Returns:
         torch.Tensor of shape (len(timestamps), C, H, W).
     """
-    # TODO(rcadene): also load audio stream at the same time
     video_path = str(video_path)
-
     # set the first and last requested timestamps
     # Note: previous timestamps are usually loaded, since we need to access the previous key frame
     first_ts = min(timestamps)
