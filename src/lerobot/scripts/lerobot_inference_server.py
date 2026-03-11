@@ -377,11 +377,8 @@ def handle_client(
                         if verbose:
                             print(f"[server] obs read error: {e}")
 
-                # Client sets "images": false during chunk execution to skip
-                # encoding — only the first step of each chunk needs fresh images.
-                want_images = msg.get("images", True)
                 images: dict[str, str] = {}
-                if want_images and cam_buffer is not None:
+                if cam_buffer is not None:
                     for cam_name, img in cam_buffer.get_latest().items():
                         if img is not None:
                             images[cam_name] = encode_image_jpeg(img, jpeg_quality)
@@ -402,9 +399,9 @@ def handle_client(
                     exec_s = time.perf_counter() - t0
                     stats.record_action(recv_t, exec_s)
                     stats.maybe_print()
-                    if stats._total_actions <= 3 or verbose:
-                        vals = [f"{action_dict.get(k, 0):.2f}" for k in JOINT_KEYS]
-                        print(f"[server] action #{stats._total_actions} exec={exec_s*1000:.2f}ms  pos={vals}")
+                    if verbose:
+                        vals = [f"{action_dict.get(k, 0):.1f}" for k in JOINT_KEYS]
+                        print(f"[server] action exec={exec_s*1000:.2f}ms  pos={vals}")
                 else:
                     if verbose:
                         print("[server] action received but arm not connected — ignoring")

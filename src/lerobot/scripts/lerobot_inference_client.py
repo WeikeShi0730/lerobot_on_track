@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+"""
+lerobot_inference_client.py  –  runs on Windows/Mac/Linux
+==========================================================
+Loads a trained lerobot policy, streams observations from the robot,
+and sends actions back — indefinitely until you press Ctrl+C.
+
+
+  SERVER (Raspberry Pi)  ←──── actions ──────  CLIENT (this machine)
+                                                       │
+                                                  policy.predict()
+                                                       │
+  SERVER (Raspberry Pi)  ────── obs/images ──►  CLIENT (this machine)
+Usage:
+    lerobot-inference-client \\
+        --host 192.168.1.42 \\
+        --policy-path ${HF_USER}/my_policy
+
+    # Test connectivity without moving the robot:
+    lerobot-inference-client \\
+        --host 192.168.1.42 \\
+        --policy-path ${HF_USER}/my_policy \\
+        --dry-run
+
+Wire protocol:
+    Each message = [4-byte little-endian uint32 length][UTF-8 JSON payload]
+"""
+
+import argparse
+import base64
+import collections
+import json
+import socket
+import struct
+import time
+
+import numpy as np
+
+# ── Optional: lerobot policy ────────────────────────────────────────────────
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    print("⚠️  torch not found — install PyTorch to run policy inference")
+
+try:
+    from lerobot.configs.policies import PreTrainedConfig
+    from lerobot.policies.factory import make_policy, make_pre_post_processors
+    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+    from lerobot.utils.control_utils import predict_action
+    LEROBOT_AVAILABLE = True
+except ImportError as _e:
+    print(f"⚠️  lerobot not found: {_e}")
+    LEROBOT_AVAILABLE = False
+
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+
+
+# ──────────────────────────────────────────────────────────────
+# Wire protocol
+# ──────────────────────────────────────────────────────────────
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("Connection closed by remote")
+        buf += chunk
+    return buf
+
+
+def recv_msg(sock: socket.socket) -> dict:
+    header = _recv_exact(sock, 4)
+    length = struct.unpack("<I", header)[0]
+    raw    = _recv_exact(sock, length)
+    return json.loads(raw.decode("utf-8"))
+
+
+def send_msg(sock: socket.socket, obj: dict) -> None:
+    raw = json.dumps(obj).encode("utf-8")
+    sock.sendall(struct.pack("<I", len(raw)) + raw)
+
+
+def connect_to_server(host: str, port: int, retries: int = 10) -> socket.socket:
+    for attempt in range(1, retries + 1):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((host, port))
+            print(f"✓ Connected to {host}:{port}")
+            return sock
+        except OSError as e:
+            print(f"  Attempt {attempt}/{retries} failed: {e}")
+            time.sleep(2)
+    raise RuntimeError(f"Could not connect to {host}:{port} after {retries} attempts")
+
+
+# ──────────────────────────────────────────────────────────────
+# Joint keys  (must match server)
+# ──────────────────────────────────────────────────────────────
+
+JOINT_KEYS = [
+    "shoulder_pan.pos",
+    "shoulder_lift.pos",
+    "elbow_flex.pos",
+    "wrist_flex.pos",
+    "wrist_roll.pos",
+    "gripper.pos",
+]
+
+
+# ──────────────────────────────────────────────────────────────
+# Observation helpers
+# ──────────────────────────────────────────────────────────────
+
+def decode_image(b64_str: str) -> np.ndarray:
+    """Decode a base64 JPEG string into an HWC uint8 numpy array."""
+    raw = base64.b64decode(b64_str)
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    if CV2_AVAILABLE:
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is not None:
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    # Fallback: return raw bytes as 1-D array (won't work with most policies)
+    return arr
+
+
+def request_observation(sock: socket.socket) -> dict:
+    """
+    Ask the server for the current full observation (joint state + camera images).
+
+    Returns a dict with keys like:
+        "observation.state"               → list[float]  (6 joint positions)
+        "observation.images.front"        → np.ndarray   (H, W, 3) uint8
+        "observation.images.base"         → np.ndarray   (H, W, 3) uint8
+        ...
+    """
+    send_msg(sock, {"type": "full_obs_request"})
+    msg = recv_msg(sock)
+    if msg.get("type") != "full_obs":
+        raise RuntimeError(f"Unexpected response: {msg.get('type')}")
+    obs = {"observation.state": np.array(msg.get("state", []), dtype=np.float32)}
+    for cam_name, b64 in msg.get("images", {}).items():
+        obs[f"observation.images.{cam_name}"] = decode_image(b64)
+    return obs
+
+
+# ──────────────────────────────────────────────────────────────
+# Policy wrapper
+# ──────────────────────────────────────────────────────────────
+
+class PolicyRunner:
+    """
+    Thin wrapper around a loaded lerobot PreTrainedPolicy.
+
+    Uses lerobot's make_pre_post_processors + predict_action pipeline (the same
+    path as lerobot-record --policy.path=...) so normalisation/denormalisation is
+    always correct without any manual heuristics.
+
+    predict(obs_dict) → action_dict  {joint_key: float}
+    """
+
+    def __init__(self, policy_path: str, dataset_repo_id: str, device: str = "cpu"):
+        if not LEROBOT_AVAILABLE:
+            raise RuntimeError("lerobot is not installed")
+        if not TORCH_AVAILABLE:
+            raise RuntimeError("torch is not installed")
+
+        import os
+        import torch
+        policy_path = os.path.expandvars(policy_path)
+
+        if device == "cuda" and not torch.cuda.is_available():
+            print("  ⚠️  CUDA not available — falling back to cpu")
+            device = "cpu"
+        elif device == "mps" and not torch.backends.mps.is_available():
+            print("  ⚠️  MPS not available — falling back to cpu")
+            device = "cpu"
+
+        print(f"  Loading policy from '{policy_path}' (device={device}) …")
+        cfg = PreTrainedConfig.from_pretrained(policy_path)
+        cfg.pretrained_path = policy_path
+        cfg.device = device
+
+        print(f"  Loading dataset metadata from '{dataset_repo_id}' …")
+        ds_meta = LeRobotDatasetMetadata(dataset_repo_id)
+
+        self.policy = make_policy(cfg, ds_meta=ds_meta)
+        self.policy.eval()
+        self.device = torch.device(device)
+
+        # Build preprocessor/postprocessor — handles input normalisation and
+        # output denormalisation using dataset stats, exactly as lerobot-record does.
+        self.preprocessor, self.postprocessor = make_pre_post_processors(
+            cfg,
+            pretrained_path=policy_path,
+            dataset_stats=ds_meta.stats,
+            preprocessor_overrides={"device_processor": {"device": device}},
+        )
+
+        print(f"✓ Policy loaded  ({type(self.policy).__name__}  device={device})")
+
+    def reset(self):
+        """Call at the start of each episode to clear recurrent / queued state."""
+        if hasattr(self.policy, "reset"):
+            self.policy.reset()
+        if hasattr(self.preprocessor, "reset"):
+            self.preprocessor.reset()
+        if hasattr(self.postprocessor, "reset"):
+            self.postprocessor.reset()
+
+    def predict(self, obs: dict) -> dict:
+        """
+        obs: dict as returned by get_obs()
+            "observation.state"        → np.ndarray (6,)   degrees
+            "observation.images.NAME"  → np.ndarray (H,W,3) uint8
+
+        Returns:
+            {joint_key: float}  degree-scale values ready to send to the robot
+        """
+        action = predict_action(
+            observation=obs,
+            policy=self.policy,
+            device=self.device,
+            preprocessor=self.preprocessor,
+            postprocessor=self.postprocessor,
+            use_amp=(self.device.type == "cuda"),
+        )
+        raw = action.cpu().numpy().flatten()  # .cpu() required: numpy cannot access GPU memory
+        if len(raw) != len(JOINT_KEYS):
+            raise ValueError(f"Policy returned {len(raw)} values, expected {len(JOINT_KEYS)}")
+        return {k: float(raw[i]) for i, k in enumerate(JOINT_KEYS)}
+
+
+# ──────────────────────────────────────────────────────────────
+# Stats
+# ──────────────────────────────────────────────────────────────
+
+class InferenceStats:
+    DISPLAY_INTERVAL = 2.0
+
+    def __init__(self, fps: int):
+        self._target_dt     = 1.0 / fps
+        self._loop_times:   collections.deque = collections.deque(maxlen=fps * 4)
+        self._infer_times:  collections.deque = collections.deque(maxlen=fps * 4)
+        self._send_times:   collections.deque = collections.deque(maxlen=fps * 4)
+        self._obs_times:    collections.deque = collections.deque(maxlen=fps * 4)
+        self._last_loop_t:  float | None      = None
+        self._last_disp_t   = time.perf_counter()
+        self._session_start = time.perf_counter()
+        self._total_steps   = 0
+        self._late_steps    = 0
+
+    def record_loop(self, t: float):
+        if self._last_loop_t is not None:
+            dt = t - self._last_loop_t
+            self._loop_times.append(dt)
+            if dt > self._target_dt * 1.5:
+                self._late_steps += 1
+        self._last_loop_t = t
+        self._total_steps += 1
+
+    def record_obs(self, dt):   self._obs_times.append(dt)
+    def record_infer(self, dt): self._infer_times.append(dt)
+    def record_send(self, dt):  self._send_times.append(dt)
+
+    def maybe_print(self, step: int):
+        now = time.perf_counter()
+        if now - self._last_disp_t < self.DISPLAY_INTERVAL:
+            return
+        self._last_disp_t = now
+        hz       = 1.0 / np.mean(self._loop_times) if len(self._loop_times) >= 2 else 0.0
+        obs_ms   = np.mean(self._obs_times)   * 1000.0 if self._obs_times   else 0.0
+        infer_ms = np.mean(self._infer_times) * 1000.0 if self._infer_times else 0.0
+        send_ms  = np.mean(self._send_times)  * 1000.0 if self._send_times  else 0.0
+        late_pct = 100.0 * self._late_steps / max(self._total_steps, 1)
+        uptime   = now - self._session_start
+        print(
+            f"\r[step={step}] Hz={hz:.1f}  "
+            f"obs={obs_ms:.1f}ms  infer={infer_ms:.1f}ms  send={send_ms:.1f}ms  "
+            f"late={late_pct:.1f}%  up={uptime:.0f}s   ",
+            end="", flush=True,
+        )
+
+    def print_summary(self):
+        uptime   = time.perf_counter() - self._session_start
+        hz       = 1.0 / np.mean(self._loop_times) if len(self._loop_times) >= 2 else 0.0
+        infer_ms = np.mean(self._infer_times) * 1000.0 if self._infer_times else float("nan")
+        late_pct = 100.0 * self._late_steps / max(self._total_steps, 1)
+        print(f"\n\n{'─'*55}")
+        print(f"  Inference session summary")
+        print(f"  Uptime:      {uptime:.1f}s")
+        print(f"  Total steps: {self._total_steps}")
+        print(f"  Avg Hz:      {hz:.1f}")
+        print(f"  Avg infer:   {infer_ms:.1f} ms")
+        print(f"  Late steps:  {self._late_steps}  ({late_pct:.1f}%)")
+        print(f"{'─'*55}\n")
+
+
+# ──────────────────────────────────────────────────────────────
+# Inference loop
+# ──────────────────────────────────────────────────────────────
+
+def get_obs(sock: socket.socket, want_images: bool = True) -> dict:
+    """Fetch one observation from the server."""
+    send_msg(sock, {"type": "full_obs_request", "images": want_images})
+    msg = recv_msg(sock)
+    if msg.get("type") != "full_obs":
+        raise RuntimeError(f"Unexpected response: {msg.get('type')}")
+    obs = {"observation.state": np.array(msg.get("state", []), dtype=np.float32)}
+    for cam_name, b64 in msg.get("images", {}).items():
+        obs[f"observation.images.{cam_name}"] = decode_image(b64)
+    return obs
+
+
+def show_images(obs: dict) -> None:
+    """Display all camera images from obs in cv2 windows (no-op if cv2 unavailable)."""
+    if not CV2_AVAILABLE:
+        return
+    for key, img in obs.items():
+        if key.startswith("observation.images.") and isinstance(img, np.ndarray):
+            cam_name = key.split(".")[-1]
+            cv2.imshow(f"cam: {cam_name}", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+    cv2.waitKey(1)
+
+
+def run_inference(
+    sock:        socket.socket,
+    policy:      "PolicyRunner",
+    fps:         int,
+    dry_run:     bool,
+    chunk_size:  int = 100,
+    show_imgs:   bool = False,
+):
+    """
+    ACT-aware inference loop.
+
+    ACT predicts a chunk of `chunk_size` actions from a single observation,
+    then executes all of them before re-querying the policy. This is the
+    correct usage pattern — re-querying every step causes the policy to
+    see the same scene repeatedly and output near-zero corrections.
+
+    Timeline per chunk:
+        1. Fetch obs (with images)          ~50-60ms once
+        2. Run policy → 100 actions         ~4ms once
+        3. Execute each action at target Hz ~33ms × 100 = 3.3s
+        4. Repeat
+    """
+    stats      = InferenceStats(fps)
+    control_dt = 1.0 / fps
+    step       = 0
+
+    # Tell the server we want ARM mode
+    send_msg(sock, {"type": "mode_request", "mode": "arm"})
+    resp = recv_msg(sock)
+    if resp.get("type") == "mode_response":
+        if resp.get("ok"):
+            print("✓ ARM mode granted\n")
+        else:
+            print(f"⚠️  ARM mode denied: {resp.get('reason')} — continuing anyway\n")
+
+    policy.reset()
+
+    print(f"Running inference — chunk_size={chunk_size}, fps={fps}")
+    print("Press Ctrl+C to stop.\n")
+
+    # Absolute scheduler: each action is due at a fixed wall-clock time so
+    # obs + infer time is absorbed into the sleep rather than added on top.
+    next_step_t = time.perf_counter()
+
+    try:
+        while True:
+            # ── 1. Observe (with images) ──────────────────────────────
+            t0 = time.perf_counter()
+            obs = get_obs(sock, want_images=True)
+            obs_ms = (time.perf_counter() - t0) * 1000
+            stats.record_obs(time.perf_counter() - t0)
+
+            if show_imgs:
+                show_images(obs)
+
+            # ── 2. Predict full action chunk ──────────────────────────
+            # ACT: first call fills the internal queue with chunk_size actions
+            # and returns the first one. Subsequent calls pop from the queue
+            # without re-running the network (obs is ignored for those calls).
+            t0 = time.perf_counter()
+            action_chunk = []
+            for _ in range(chunk_size):
+                action_chunk.append(policy.predict(obs))
+            infer_dt = time.perf_counter() - t0
+            infer_ms = infer_dt * 1000
+            stats.record_infer(infer_dt)
+
+            state_str = " ".join(f"{v:.1f}" for v in obs["observation.state"].tolist())
+            print(f"[chunk] obs={obs_ms:.0f}ms  infer={infer_ms:.0f}ms  "
+                  f"state=[{state_str}]  "
+                  f"first={[f'{v:.1f}' for v in action_chunk[0].values()]}")
+
+            # ── 3. Execute chunk at target Hz ─────────────────────────
+            for i, action_dict in enumerate(action_chunk):
+                # Sleep until this step's scheduled wall-clock time.
+                # This absorbs obs + infer cost so the loop runs at true target Hz.
+                sleep_t = next_step_t - time.perf_counter()
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
+                next_step_t += control_dt
+
+                loop_start = time.perf_counter()
+                stats.record_loop(loop_start)
+
+                if dry_run:
+                    vals = [f"{action_dict[k]:6.2f}" for k in JOINT_KEYS]
+                    print(f"\r  [dry-run] step={step:5d}  {vals}", end="", flush=True)
+                else:
+                    t0 = time.perf_counter()
+                    send_msg(sock, {"type": "action", "action": action_dict})
+                    stats.record_send(time.perf_counter() - t0)
+
+                step += 1
+                stats.maybe_print(step)
+
+    except KeyboardInterrupt:
+        print("\n\nStopped by user.")
+    finally:
+        stats.print_summary()
+        try:
+            send_msg(sock, {"type": "disconnect"})
+        except Exception:
+            pass
+
+
+# ──────────────────────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run lerobot policy inference against a robot on a Raspberry Pi",
+    )
+    parser.add_argument("--host",        required=True, help="Raspberry Pi IP address")
+    parser.add_argument("--tcp-port",    type=int, default=2222)
+    parser.add_argument("--policy-path", required=True,
+                        help="HF repo id or local path of the trained policy")
+    parser.add_argument("--dataset-repo-id", required=True,
+                        help="HF repo id of the training dataset (e.g. user/my_dataset)")
+    parser.add_argument("--device",      default="cpu",
+                        help="Torch device: cpu, cuda, mps (default: cpu)")
+    parser.add_argument("--fps",         type=int, default=30,
+                        help="Control frequency in Hz (default: 30)")
+    parser.add_argument("--chunk-size",  type=int, default=100,
+                        help="Actions to execute per observation (default: 100 for ACT). "
+                             "Must match the policy's chunk_size in config.json.")
+    parser.add_argument("--dry-run",     action="store_true",
+                        help="Print actions without sending them to the robot")
+    parser.add_argument("--show-images", action="store_true",
+                        help="Display camera frames in cv2 windows during inference")
+    args = parser.parse_args()
+
+    policy = PolicyRunner(args.policy_path, dataset_repo_id=args.dataset_repo_id, device=args.device)
+
+    print("\n" + "=" * 45)
+    print("  LEROBOT INFERENCE CLIENT")
+    print("=" * 45)
+    if dry_run := args.dry_run:
+        print("  ⚠️  DRY-RUN — actions will NOT be sent")
+    print(f"  FPS:    {args.fps}")
+    print(f"  Device: {args.device}")
+    print()
+
+    sock = connect_to_server(args.host, args.tcp_port)
+    try:
+        run_inference(sock, policy, fps=args.fps, dry_run=dry_run,
+                      chunk_size=args.chunk_size, show_imgs=args.show_images)
+    finally:
+        sock.close()
+        print("✓ Socket closed.")
+
+
+if __name__ == "__main__":
+    main()
