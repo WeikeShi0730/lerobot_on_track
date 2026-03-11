@@ -215,6 +215,8 @@ lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-gamepad-control="lerobot.scripts.lerobot_gamepad_control:main"
 lerobot-gamepad-control-client="lerobot.scripts.lerobot_gamepad_control_client:main"
 lerobot-gamepad-control-server="lerobot.scripts.lerobot_gamepad_control_server:main"
+lerobot-inference-client="lerobot.scripts.lerobot_inference_client:main"
+lerobot-inference-server="lerobot.scripts.lerobot_inference_server:main"
 
 # ---------------- Tool Configurations ----------------
 [tool.setuptools.package-data]
