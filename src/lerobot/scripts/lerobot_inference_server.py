@@ -378,7 +378,7 @@ def handle_client(
                             print(f"[server] obs read error: {e}")
 
                 images: dict[str, str] = {}
-                if cam_buffer is not None:
+                if cam_buffer is not None and msg.get("images", True):
                     for cam_name, img in cam_buffer.get_latest().items():
                         if img is not None:
                             images[cam_name] = encode_image_jpeg(img, jpeg_quality)
