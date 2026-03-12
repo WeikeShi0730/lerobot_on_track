@@ -205,6 +205,11 @@ class PolicyRunner:
 
         print(f"✓ Policy loaded  ({type(self.policy).__name__}  device={device})")
 
+    @property
+    def n_action_steps(self) -> int:
+        """How many queue-pop steps between NN re-runs."""
+        return getattr(getattr(self.policy, "config", None), "n_action_steps", 1)
+
     def reset(self):
         """Call at the start of each episode to clear recurrent / queued state."""
         if hasattr(self.policy, "reset"):
@@ -330,26 +335,18 @@ def show_images(obs: dict) -> None:
 
 
 def run_inference(
-    sock:        socket.socket,
-    policy:      "PolicyRunner",
-    fps:         int,
-    dry_run:     bool,
-    chunk_size:  int = 100,
-    show_imgs:   bool = False,
+    sock:      socket.socket,
+    policy:    "PolicyRunner",
+    fps:       int,
+    dry_run:   bool,
+    show_imgs: bool = False,
 ):
     """
-    ACT-aware inference loop.
+    Inference loop — ACT's internal queue handles chunking transparently.
 
-    ACT predicts a chunk of `chunk_size` actions from a single observation,
-    then executes all of them before re-querying the policy. This is the
-    correct usage pattern — re-querying every step causes the policy to
-    see the same scene repeatedly and output near-zero corrections.
-
-    Timeline per chunk:
-        1. Fetch obs (with images)          ~50-60ms once
-        2. Run policy → 100 actions         ~4ms once
-        3. Execute each action at target Hz ~33ms × 100 = 3.3s
-        4. Repeat
+    policy.predict() calls select_action() which runs the NN only when its
+    internal queue is empty (every n_action_steps steps), then pops pre-computed
+    actions for subsequent steps.  No manual chunk loop needed here.
     """
     stats      = InferenceStats(fps)
     control_dt = 1.0 / fps
@@ -366,63 +363,54 @@ def run_inference(
 
     policy.reset()
 
-    print(f"Running inference — chunk_size={chunk_size}, fps={fps}")
+    n_action_steps = policy.n_action_steps
+    print(f"Running inference at {fps} Hz  (n_action_steps={n_action_steps})")
     print("Press Ctrl+C to stop.\n")
 
     # Absolute scheduler: each action is due at a fixed wall-clock time so
     # obs + infer time is absorbed into the sleep rather than added on top.
     next_step_t = time.perf_counter()
 
+    obs: dict | None = None
+
     try:
         while True:
-            # ── 1. Observe (with images) ──────────────────────────────
+            # ── 1. Observe ────────────────────────────────────────────
+            # Fetch obs only when the NN will run (every n_action_steps).
+            # Queue-pop steps don't use obs at all — reuse the cached one.
+            if step % n_action_steps == 0:
+                t0 = time.perf_counter()
+                obs = get_obs(sock, want_images=True)
+                stats.record_obs(time.perf_counter() - t0)
+
+                if show_imgs:
+                    show_images(obs)
+
+            # ── 2. Predict next action ────────────────────────────────
+            # ACT runs the NN only when its queue is empty (every n_action_steps
+            # steps); all other calls just pop the next pre-computed action.
             t0 = time.perf_counter()
-            obs = get_obs(sock, want_images=True)
-            obs_ms = (time.perf_counter() - t0) * 1000
-            stats.record_obs(time.perf_counter() - t0)
+            action_dict = policy.predict(obs)
+            stats.record_infer(time.perf_counter() - t0)
 
-            if show_imgs:
-                show_images(obs)
+            # ── 3. Execute at target Hz ───────────────────────────────
+            sleep_t = next_step_t - time.perf_counter()
+            if sleep_t > 0:
+                time.sleep(sleep_t)
+            next_step_t += control_dt
 
-            # ── 2. Predict full action chunk ──────────────────────────
-            # ACT: first call fills the internal queue with chunk_size actions
-            # and returns the first one. Subsequent calls pop from the queue
-            # without re-running the network (obs is ignored for those calls).
-            t0 = time.perf_counter()
-            action_chunk = []
-            for _ in range(chunk_size):
-                action_chunk.append(policy.predict(obs))
-            infer_dt = time.perf_counter() - t0
-            infer_ms = infer_dt * 1000
-            stats.record_infer(infer_dt)
+            stats.record_loop(time.perf_counter())
 
-            state_str = " ".join(f"{v:.1f}" for v in obs["observation.state"].tolist())
-            print(f"[chunk] obs={obs_ms:.0f}ms  infer={infer_ms:.0f}ms  "
-                  f"state=[{state_str}]  "
-                  f"first={[f'{v:.1f}' for v in action_chunk[0].values()]}")
+            if dry_run:
+                vals = [f"{action_dict[k]:6.2f}" for k in JOINT_KEYS]
+                print(f"\r  [dry-run] step={step:5d}  {vals}", end="", flush=True)
+            else:
+                t0 = time.perf_counter()
+                send_msg(sock, {"type": "action", "action": action_dict})
+                stats.record_send(time.perf_counter() - t0)
 
-            # ── 3. Execute chunk at target Hz ─────────────────────────
-            for i, action_dict in enumerate(action_chunk):
-                # Sleep until this step's scheduled wall-clock time.
-                # This absorbs obs + infer cost so the loop runs at true target Hz.
-                sleep_t = next_step_t - time.perf_counter()
-                if sleep_t > 0:
-                    time.sleep(sleep_t)
-                next_step_t += control_dt
-
-                loop_start = time.perf_counter()
-                stats.record_loop(loop_start)
-
-                if dry_run:
-                    vals = [f"{action_dict[k]:6.2f}" for k in JOINT_KEYS]
-                    print(f"\r  [dry-run] step={step:5d}  {vals}", end="", flush=True)
-                else:
-                    t0 = time.perf_counter()
-                    send_msg(sock, {"type": "action", "action": action_dict})
-                    stats.record_send(time.perf_counter() - t0)
-
-                step += 1
-                stats.maybe_print(step)
+            step += 1
+            stats.maybe_print(step)
 
     except KeyboardInterrupt:
         print("\n\nStopped by user.")
@@ -452,9 +440,6 @@ def main():
                         help="Torch device: cpu, cuda, mps (default: cpu)")
     parser.add_argument("--fps",         type=int, default=30,
                         help="Control frequency in Hz (default: 30)")
-    parser.add_argument("--chunk-size",  type=int, default=100,
-                        help="Actions to execute per observation (default: 100 for ACT). "
-                             "Must match the policy's chunk_size in config.json.")
     parser.add_argument("--dry-run",     action="store_true",
                         help="Print actions without sending them to the robot")
     parser.add_argument("--show-images", action="store_true",
@@ -475,7 +460,7 @@ def main():
     sock = connect_to_server(args.host, args.tcp_port)
     try:
         run_inference(sock, policy, fps=args.fps, dry_run=dry_run,
-                      chunk_size=args.chunk_size, show_imgs=args.show_images)
+                      show_imgs=args.show_images)
     finally:
         sock.close()
         print("✓ Socket closed.")
