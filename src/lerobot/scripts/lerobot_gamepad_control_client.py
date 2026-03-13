@@ -33,6 +33,7 @@ Controls:
 """
 
 import argparse
+import base64
 import collections
 import json
 import platform
@@ -43,6 +44,37 @@ from pathlib import Path
 
 import numpy as np
 import pygame
+
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+
+
+# ──────────────────────────────────────────────────────────────
+# Image helpers (mirrors inference client)
+# ──────────────────────────────────────────────────────────────
+
+def decode_image(b64_str: str) -> np.ndarray:
+    """Decode a base64 JPEG string into an HWC uint8 numpy array."""
+    raw = base64.b64decode(b64_str)
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    if CV2_AVAILABLE:
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is not None:
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return arr
+
+
+def show_images(images: dict) -> None:
+    """Display decoded camera images in cv2 windows (no-op if cv2 unavailable)."""
+    if not CV2_AVAILABLE:
+        return
+    for cam_name, img in images.items():
+        if isinstance(img, np.ndarray) and img.ndim == 3:
+            cv2.imshow(f"cam: {cam_name}", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+    cv2.waitKey(1)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -289,6 +321,8 @@ class SO101GamepadClient:
         robot_id: str = "so101_follower",
         max_speed: float = 2.0,
         control_frequency: int = 30,
+        show_images: bool = False,
+        image_hz: int = 5,
     ):
         self.sock = sock
         self.max_speed = max_speed
@@ -357,6 +391,13 @@ class SO101GamepadClient:
         self.mode = None
         self._prev_rb = False   # previous frame button states for edge detection
         self._prev_lb = False
+
+        # ── Camera display ──────────────────────────────────────
+        self._show_images = show_images and CV2_AVAILABLE
+        if show_images and not CV2_AVAILABLE:
+            print("  ⚠️  --show-images requested but opencv-python is not installed — skipping")
+        self._img_interval = max(1, control_frequency // max(1, image_hz))
+        self._img_frame    = 0
 
         # ── Observability ───────────────────────────────────────
         self.stats = ClientStats(control_frequency)
@@ -483,34 +524,63 @@ class SO101GamepadClient:
         # ── Idle — nothing to send ─────────────────────────────────
         return "idle"
 
+    def _apply_mode_response(self, msg: dict) -> None:
+        requested = msg.get("mode")
+        ok        = msg.get("ok", False)
+        reason    = msg.get("reason", "")
+        if ok:
+            if requested == "arm":
+                self._send_motor(0.0, 0.0)   # stop motors when entering arm mode
+            self.mode = requested
+            print(f"Mode: {requested.upper()}")
+        else:
+            print(f"⚠️  {requested.upper()} mode unavailable — {reason}")
+
     def _handle_server_msg(self) -> None:
         """Non-blocking check for incoming server messages (pongs, mode_response, etc.)."""
         self.sock.setblocking(False)
         try:
-            msg = recv_msg(self.sock)
+            msg   = recv_msg(self.sock)
             mtype = msg.get("type")
-
             if mtype == "pong":
                 self.stats.record_pong(msg)
-
             elif mtype == "mode_response":
-                requested = msg.get("mode")
-                ok        = msg.get("ok", False)
-                reason    = msg.get("reason", "")
-                if ok:
-                    if requested == "arm":
-                        self._send_motor(0.0, 0.0)   # stop motors when entering arm mode
-                    self.mode = requested
-                    print(f"Mode: {requested.upper()}")
-                else:
-                    print(f"⚠️  {requested.upper()} mode unavailable — {reason}")
-
+                self._apply_mode_response(msg)
         except BlockingIOError:
             pass
         except Exception:
             pass
         finally:
             self.sock.setblocking(True)
+
+    def _maybe_show_images(self) -> None:
+        """Periodically request camera frames from the server and display them."""
+        if not self._show_images:
+            return
+        self._img_frame += 1
+        if self._img_frame % self._img_interval != 0:
+            return
+        try:
+            send_msg(self.sock, {"type": "full_obs_request", "images": True})
+            # Read until we get full_obs; handle any queued pong/mode_response first.
+            while True:
+                resp  = recv_msg(self.sock)
+                rtype = resp.get("type")
+                if rtype == "full_obs":
+                    imgs = {}
+                    for cam_name, b64 in resp.get("images", {}).items():
+                        if b64:
+                            imgs[cam_name] = decode_image(b64)
+                    show_images(imgs)
+                    break
+                elif rtype == "pong":
+                    self.stats.record_pong(resp)
+                elif rtype == "mode_response":
+                    self._apply_mode_response(resp)
+                else:
+                    break   # unexpected — stop waiting to avoid blocking forever
+        except Exception:
+            pass
 
     # ── Main loop ──────────────────────────────────────────────
 
@@ -557,39 +627,33 @@ class SO101GamepadClient:
                 if isinstance(action, dict) and action.get("motor"):
                     self._send_motor(action["m1"], action["m2"])
                     self.stats.maybe_print(self.current_position, False)
-                    sleep_time = self.control_dt - (time.perf_counter() - loop_start)
-                    if sleep_time > 0:
-                        time.sleep(sleep_time)
-                    continue
 
                 # ── Idle ───────────────────────────────────────
-                if isinstance(action, str) and action == "idle":
-                    sleep_time = self.control_dt - (time.perf_counter() - loop_start)
-                    if sleep_time > 0:
-                        time.sleep(sleep_time)
-                    continue
+                elif isinstance(action, str) and action == "idle":
+                    pass   # nothing to send
 
                 # ── Preset handling ────────────────────────────
-                if isinstance(action, str):
+                elif isinstance(action, str):
                     preset_name = action.removeprefix("preset_")
                     target = PRESET_POSITIONS.get(preset_name, PRESET_POSITIONS["home"]).copy()
                     target = np.clip(target, self.joint_limits_lower, self.joint_limits_upper)
                     self._send_preset(target)
                     self.current_position = target
-                    time.sleep(0.5)
-                    continue
 
                 # ── Arm continuous control ─────────────────────
-                target = np.clip(
-                    self.current_position + action,
-                    self.joint_limits_lower,
-                    self.joint_limits_upper,
-                )
-                self._send_position(target)
-                self.current_position = target
+                else:
+                    target = np.clip(
+                        self.current_position + action,
+                        self.joint_limits_lower,
+                        self.joint_limits_upper,
+                    )
+                    self._send_position(target)
+                    self.current_position = target
+                    self.stats.maybe_print(self.current_position, self.mode == "arm")
 
-                # ── Stats + display ───────────────────────────
-                self.stats.maybe_print(self.current_position, self.mode == "arm")
+                # ── Camera display (throttled, all modes) ──────
+                self._maybe_show_images()
+
                 sleep_time = self.control_dt - (time.perf_counter() - loop_start)
                 if sleep_time > 0:
                     time.sleep(sleep_time)
@@ -606,6 +670,8 @@ class SO101GamepadClient:
             send_msg(self.sock, {"type": "disconnect"})
         except Exception:
             pass
+        if CV2_AVAILABLE:
+            cv2.destroyAllWindows()
         pygame.quit()
         print("✓ Cleanup complete")
 
@@ -624,6 +690,10 @@ def main():
     parser.add_argument("--max-speed",  type=float, default=2.0,
                         help="Max joint speed in degrees/step (default: 2.0)")
     parser.add_argument("--frequency",  type=int, default=30,   help="Control Hz (default: 30)")
+    parser.add_argument("--show-images", action="store_true",
+                        help="Display camera frames streamed from the server (requires opencv)")
+    parser.add_argument("--image-hz",  type=int, default=5,
+                        help="Camera display refresh rate in Hz (default: 5)")
     args = parser.parse_args()
 
     sock = connect_to_server(args.host, args.tcp_port)
@@ -633,6 +703,8 @@ def main():
             robot_id=args.robot_id,
             max_speed=args.max_speed,
             control_frequency=args.frequency,
+            show_images=args.show_images,
+            image_hz=args.image_hz,
         )
         controller.run()
     finally:
