@@ -30,6 +30,7 @@ import argparse
 import base64
 import collections
 import json
+import logging
 import socket
 import struct
 import time
@@ -380,11 +381,17 @@ def run_inference(
             # Queue-pop steps don't use obs at all — reuse the cached one.
             if step % n_action_steps == 0:
                 t0 = time.perf_counter()
-                obs = get_obs(sock, want_images=True)
-                stats.record_obs(time.perf_counter() - t0)
+                new_obs = get_obs(sock, want_images=True)
+                elapsed = time.perf_counter() - t0
 
-                if show_imgs:
-                    show_images(obs)
+                state = new_obs.get("observation.state", np.array([]))
+                if len(state) == 0:
+                    logging.warning("step=%d: server returned empty state — reusing cached obs", step)
+                else:
+                    obs = new_obs
+                    stats.record_obs(elapsed)
+                    if show_imgs:
+                        show_images(obs)
 
             # ── 2. Predict next action ────────────────────────────────
             # ACT runs the NN only when its queue is empty (every n_action_steps
