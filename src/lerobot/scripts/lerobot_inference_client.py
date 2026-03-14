@@ -131,26 +131,6 @@ def decode_image(b64_str: str) -> np.ndarray:
     return arr
 
 
-def request_observation(sock: socket.socket) -> dict:
-    """
-    Ask the server for the current full observation (joint state + camera images).
-
-    Returns a dict with keys like:
-        "observation.state"               → list[float]  (6 joint positions)
-        "observation.images.front"        → np.ndarray   (H, W, 3) uint8
-        "observation.images.base"         → np.ndarray   (H, W, 3) uint8
-        ...
-    """
-    send_msg(sock, {"type": "full_obs_request"})
-    msg = recv_msg(sock)
-    if msg.get("type") != "full_obs":
-        raise RuntimeError(f"Unexpected response: {msg.get('type')}")
-    obs = {"observation.state": np.array(msg.get("state", []), dtype=np.float32)}
-    for cam_name, b64 in msg.get("images", {}).items():
-        obs[f"observation.images.{cam_name}"] = decode_image(b64)
-    return obs
-
-
 # ──────────────────────────────────────────────────────────────
 # Policy wrapper
 # ──────────────────────────────────────────────────────────────
