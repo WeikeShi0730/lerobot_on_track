@@ -728,6 +728,8 @@ def handle_client(
                 is_preset: bool   = msg.get("preset", False)
                 recv_t = time.perf_counter()
                 if is_preset:
+                    if _preset_busy.is_set():
+                        return   # ignore — preset already in progress, unsafe to stack
                     # Run in a background thread so the recv loop stays live and
                     # can respond to full_obs_request while the arm is moving.
                     def _preset_worker(ad=action_dict):
@@ -791,17 +793,7 @@ def handle_client(
         # ── ping → pong ──────────────────────────────────────────────────
         elif mtype == "ping":
             stats.record_ping()
-            pong: dict = {"type": "pong", "seq": msg.get("seq")}
-            # Piggyback current joint state so the client can keep its
-            # dead-reckoning position in sync without a separate round-trip.
-            if robot_arm is not None:
-                try:
-                    with _arm_lock:
-                        obs_dict = get_observation_dict(robot_arm)
-                    pong["state"] = [float(obs_dict.get(k, 0.0)) for k in JOINT_KEYS]
-                except Exception:
-                    pass
-            send_msg(conn, pong)
+            send_msg(conn, {"type": "pong", "seq": msg.get("seq")})
 
         # ── full observation request (joint state + camera images) ───────
         elif mtype == "full_obs_request":

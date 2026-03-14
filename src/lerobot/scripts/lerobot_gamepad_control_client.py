@@ -391,6 +391,10 @@ class SO101GamepadClient:
         self.mode = None
         self._prev_rb = False   # previous frame button states for edge detection
         self._prev_lb = False
+        self._prev_a  = False
+        self._prev_b  = False
+        self._prev_x  = False
+        self._prev_y  = False
 
         # ── Camera display ──────────────────────────────────────
         self._show_images = show_images and CV2_AVAILABLE
@@ -457,13 +461,25 @@ class SO101GamepadClient:
 
         rb = self.joystick.get_button(self.BTN_RB)
         lb = self.joystick.get_button(self.BTN_LB)
+        a  = self.joystick.get_button(self.BTN_A)
+        b  = self.joystick.get_button(self.BTN_B)
+        x  = self.joystick.get_button(self.BTN_X)
+        y  = self.joystick.get_button(self.BTN_Y)
 
         # Rising-edge detection (tap, not hold)
         rb_pressed = rb and not self._prev_rb
         lb_pressed = lb and not self._prev_lb
+        a_pressed  = a  and not self._prev_a
+        b_pressed  = b  and not self._prev_b
+        x_pressed  = x  and not self._prev_x
+        y_pressed  = y  and not self._prev_y
 
         self._prev_rb = rb
         self._prev_lb = lb
+        self._prev_a  = a
+        self._prev_b  = b
+        self._prev_x  = x
+        self._prev_y  = y
 
         # ── Mode switching ────────────────────────────────────────
         # On bumper tap, ask the server if that mode is available.
@@ -482,16 +498,16 @@ class SO101GamepadClient:
         if self.joystick.get_button(self.BTN_START):
             self.running = False
             return None
-        if self.joystick.get_button(self.BTN_A):
+        if a_pressed:
             print("→ Moving to HOME position")
             return "preset_home"
-        if self.joystick.get_button(self.BTN_B):
+        if b_pressed:
             print("→ Moving to MOVEMENT position")
             return "preset_movement"
-        if self.joystick.get_button(self.BTN_X):
+        if x_pressed:
             print("→ Moving to DROP position")
             return "preset_drop"
-        if self.joystick.get_button(self.BTN_Y):
+        if y_pressed:
             print("→ Moving to GRAB position")
             return "preset_grab"
 
@@ -556,9 +572,6 @@ class SO101GamepadClient:
             mtype = msg.get("type")
             if mtype == "pong":
                 self.stats.record_pong(msg)
-                # Correct dead-reckoning drift using the state piggybacked on pong
-                if "state" in msg:
-                    self.current_position = np.array(msg["state"], dtype=np.float32)
             elif mtype == "mode_response":
                 self._apply_mode_response(msg)
         except BlockingIOError:
