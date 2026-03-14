@@ -257,7 +257,8 @@ PRESET_POSITIONS = {
     "home":     np.array([0.0,   -108.0,  95.0,   55.0,   -90.0,  0.0],  dtype=np.float32),
     "movement": np.array([0.3,   -85.7,   95.0,  -23.0,   -90.0,  0.0],  dtype=np.float32),
     "grab":     np.array([-12.3,   60.9,  -38.3,  73.0,   -90.0,  64.1],  dtype=np.float32),
-    "drop":     np.array([0.7,    -3.9,  -72.2, -107.6,   -90.0, 0.0],  dtype=np.float32),
+    # "drop":     np.array([0.7,    -3.9,  -72.2, -107.6,   -90.0, 0.0],  dtype=np.float32),
+    "drop":     np.array([-2.5,   -30.0,  -98.0, -107.6,   90.0,  -3.3],  dtype=np.float32),
 }
 
 SERVO_CENTER = 2048

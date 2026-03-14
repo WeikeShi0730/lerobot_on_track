@@ -1,77 +1,97 @@
 #!/usr/bin/env python3
 """
-lerobot_inference_server.py  –  runs on Raspberry Pi
-=====================================================
-Connects the robot arm and cameras, then waits for a client to connect.
-
-For each step the client sends:
-  1. full_obs_request  → server replies with joint state + camera images
-  2. action            → server moves the arm
-
-That's it. No dataset recording, no episode tracking, no HuggingFace uploads.
-Those belong in the training/data-collection workflow (lerobot_gamepad_control_server.py).
+lerobot_gamepad_control_server.py  –  runs on server Raspberry Pi
+================================================
+Receives action dicts from the Windows gamepad client (or policy client)
+over TCP and drives the SO-101 follower arm.
 
 Usage:
-    python lerobot_inference_server.py \\
-        --arm-port /dev/ttyACM0 \\
-        --robot-id so101_follower \\
-        --cameras "{ front: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 15}, \\
-                     base:  {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 15}}"
+    # Both arm and motors (default)
+    lerobot-gamepad-control-server --host=192.168.2.72 --tcp-port=2222 --arm-port=/dev/ttyACM0 --robot-id=so101_follower
 
-Wire protocol:
+    # Arm only
+    lerobot-gamepad-control-server --no-motors --host=192.168.2.72 --tcp-port=2222 --arm-port=/dev/ttyACM0 --robot-id=so101_follower
+
+    # Motors only
+    lerobot-gamepad-control-server --no-arm --host=192.168.2.72 --tcp-port=2222 --arm-port=/dev/ttyACM0 --robot-id=so101_follower
+
+    # Custom serial port or TCP port
+    lerobot-gamepad-control-server --host=192.168.2.72 --tcp-port=5555 --arm-port=/dev/ttyACM1 --robot-id=so101_follower
+
+    # Record a dataset while teleoperating (arm only, motors are not recorded)
+    lerobot-gamepad-control-server --host=192.168.2.72 --tcp-port=2222 --arm-port=/dev/ttyACM0 --robot-id=so101_follower \
+        --repo-id=${HF_USER}/sock-grab \
+        --task="Grab the sock" \
+        --num-episodes=10 \
+        --episode-time=60 \
+        --reset-time=30 \
+        --cameras="front:/dev/video0,base:/dev/video2" \
+        --no-motors
+
+    Recording episode flow (keyboard on Pi terminal):
+        Enter        save episode and move to reset
+        r + Enter    discard episode and rerecord
+        q + Enter    stop recording session early
+
+Wire protocol (shared with client):
     Each message = [4-byte little-endian uint32 length][UTF-8 JSON payload]
 """
 
 import argparse
-import base64
 import collections
 import json
+import select
 import socket
 import struct
-import threading
+import sys
 import time
+import threading
 from pathlib import Path
+
+import base64
 
 import numpy as np
 
-# ── lerobot SO-101 arm ──────────────────────────────────────────────────────
+try:
+    import cv2 as _cv2
+    _CV2_AVAILABLE = True
+except ImportError:
+    _cv2 = None
+    _CV2_AVAILABLE = False
+
+# Dataset recording (lerobot)
+try:
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
+    RECORDING_AVAILABLE = True
+except Exception as _rec_err:
+    print(f"⚠️  lerobot dataset/camera import failed: {_rec_err}  — recording disabled")
+    LeRobotDataset = None
+    RECORDING_AVAILABLE = False
+
+# Arm control (lerobot SO-101)
 try:
     from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
     ARM_AVAILABLE = True
-except Exception as _arm_err:
-    print(f"⚠️  lerobot arm import failed: {_arm_err}  — arm control disabled")
-    SO101Follower = SO101FollowerConfig = None
+except Exception as _arm_import_err:
+    print(f"⚠️  lerobot import failed: {_arm_import_err}  — arm control disabled")
+    SO101Follower = None
+    SO101FollowerConfig = None
     ARM_AVAILABLE = False
 
-# ── lerobot cameras ─────────────────────────────────────────────────────────
-try:
-    from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
-    CAMERAS_AVAILABLE = True
-except Exception as _cam_err:
-    print(f"⚠️  lerobot camera import failed: {_cam_err}  — cameras disabled")
-    OpenCVCamera = OpenCVCameraConfig = None
-    CAMERAS_AVAILABLE = False
-
-# ── OpenCV for JPEG encoding ─────────────────────────────────────────────────
-try:
-    import cv2
-    CV2_AVAILABLE = True
-except ImportError:
-    CV2_AVAILABLE = False
-    print("⚠️  opencv-python not found — camera images will not be sent to client")
-
-# ── GPIO motors (optional, Raspberry Pi only) ────────────────────────────────
+# Motor control (gpiozero + lgpio for Raspberry Pi 5)
 try:
     from gpiozero import Motor, Device
     from gpiozero.pins.lgpio import LGPIOFactory
     Device.pin_factory = LGPIOFactory()
     MOTORS_AVAILABLE = True
-except Exception:
+except Exception as _gpio_err:
+    print(f"⚠️  GPIO motor init failed: {_gpio_err}  — motor control disabled")
     MOTORS_AVAILABLE = False
 
 
 # ──────────────────────────────────────────────────────────────
-# Wire protocol
+# Wire protocol helpers
 # ──────────────────────────────────────────────────────────────
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
@@ -87,7 +107,7 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 def recv_msg(sock: socket.socket) -> dict:
     header = _recv_exact(sock, 4)
     length = struct.unpack("<I", header)[0]
-    raw    = _recv_exact(sock, length)
+    raw = _recv_exact(sock, length)
     return json.loads(raw.decode("utf-8"))
 
 
@@ -101,8 +121,10 @@ def send_msg(sock: socket.socket, obj: dict) -> None:
 # ──────────────────────────────────────────────────────────────
 
 class ServerStats:
-    DISPLAY_INTERVAL = 2.0
-    HZ_WINDOW        = 60
+    """Per-session receive and execution metrics."""
+
+    DISPLAY_INTERVAL = 2.0   # seconds between log lines
+    HZ_WINDOW        = 60    # samples for rolling Hz estimate
 
     def __init__(self):
         self._action_times: collections.deque = collections.deque(maxlen=self.HZ_WINDOW)
@@ -113,73 +135,110 @@ class ServerStats:
         self._total_actions  = 0
         self._total_pings    = 0
 
-    def record_action(self, recv_t: float, exec_s: float):
+    def record_action(self, recv_t: float, exec_s: float) -> None:
+        # recv_t = timestamp taken BEFORE robot.send_action() — marks when the
+        #          message arrived, independent of how long execution took.
+        # exec_s = how long robot.send_action() itself took (servo comms).
         if self._last_action_t is not None:
             self._action_times.append(recv_t - self._last_action_t)
         self._last_action_t = recv_t
         self._exec_times.append(exec_s)
         self._total_actions += 1
 
-    def record_ping(self):
+    def record_ping(self) -> None:
         self._total_pings += 1
 
-    def maybe_print(self):
+    def maybe_print(self) -> None:
         now = time.perf_counter()
         if now - self._last_display_t < self.DISPLAY_INTERVAL:
             return
         self._last_display_t = now
-        hz      = 1.0 / np.mean(self._action_times) if len(self._action_times) >= 2 else 0.0
-        jitter  = np.std(self._action_times) * 1000.0 if len(self._action_times) >= 2 else 0.0
+
+        if len(self._action_times) >= 2:
+            avg_inter = np.mean(self._action_times)
+            recv_hz   = 1.0 / avg_inter if avg_inter > 0 else 0.0
+            jitter_ms = np.std(self._action_times) * 1000.0
+        else:
+            recv_hz   = 0.0
+            jitter_ms = 0.0
+
         exec_ms = np.mean(self._exec_times) * 1000.0 if self._exec_times else 0.0
-        uptime  = now - self._session_start
+        uptime   = now - self._session_start
+
         print(
-            f"[server] recv={hz:.1f}Hz  exec={exec_ms:.2f}ms  "
-            f"jitter={jitter:.2f}ms  actions={self._total_actions}  "
-            f"pings={self._total_pings}  up={uptime:.0f}s"
+            f"[server] recv={recv_hz:.1f}Hz  "
+            f"exec={exec_ms:.2f}ms  "
+            f"jitter={jitter_ms:.2f}ms  "
+            f"actions={self._total_actions}  "
+            f"pings={self._total_pings}  "
+            f"up={uptime:.0f}s"
         )
 
-    def print_summary(self):
+    def print_summary(self) -> None:
         uptime   = time.perf_counter() - self._session_start
         exec_avg = np.mean(self._exec_times) * 1000.0 if self._exec_times else float("nan")
-        print(f"\n[server] ── Session summary ─────────────────────────")
+        print(f"\n[server] ── Session summary ──────────────────────────")
         print(f"[server]   Uptime:        {uptime:.1f}s")
         print(f"[server]   Total actions: {self._total_actions}")
         print(f"[server]   Total pings:   {self._total_pings}")
         print(f"[server]   Avg exec time: {exec_avg:.2f} ms")
-        print(f"[server] ────────────────────────────────────────────")
+        print(f"[server] ──────────────────────────────────────────────")
 
 
 # ──────────────────────────────────────────────────────────────
-# Motor controller  (optional)
+# Motor controller
 # ──────────────────────────────────────────────────────────────
 
 class MotorController:
-    def __init__(self, m1_forward=17, m1_backward=18, m1_enable=25,
-                       m2_forward=22, m2_backward=23, m2_enable=24):
+    """
+    Wraps two gpiozero Motor objects.
+    Receives speed values in [-1.0, 1.0]:
+      positive → forward, negative → backward, 0 → stop
+    """
+
+    def __init__(
+        self,
+        # Motor 1 pins
+        m1_forward: int = 17,
+        m1_backward: int = 18,
+        m1_enable: int = 25,
+        # Motor 2 pins
+        m2_forward: int = 22,
+        m2_backward: int = 23,
+        m2_enable: int = 24,
+    ):
         if not MOTORS_AVAILABLE:
-            raise RuntimeError("gpiozero/lgpio not available")
+            raise RuntimeError("gpiozero/lgpio not available — cannot create MotorController")
         self.motor1 = Motor(forward=m1_forward, backward=m1_backward, enable=m1_enable, pwm=True)
         self.motor2 = Motor(forward=m2_forward, backward=m2_backward, enable=m2_enable, pwm=True)
-        print("✓ Motors initialised")
+        print(f"✓ Motors initialised  M1=(fwd={m1_forward},bwd={m1_backward},en={m1_enable})  "
+              f"M2=(fwd={m2_forward},bwd={m2_backward},en={m2_enable})")
 
-    def set(self, m1: float, m2: float):
+    def set(self, m1: float, m2: float) -> None:
+        """
+        Set motor speeds. Values in [-1.0, 1.0].
+        Positive = forward, negative = backward, 0 = stop (coast).
+        """
         self._drive(self.motor1, m1)
         self._drive(self.motor2, m2)
 
     @staticmethod
-    def _drive(motor, value: float):
-        value = max(-1.0, min(1.0, value))
-        if abs(value) < 0.01: motor.stop()
-        elif value > 0:        motor.forward(value)
-        else:                  motor.backward(-value)
+    def _drive(motor, value: float) -> None:
+        value = max(-1.0, min(1.0, value)) # clamp
+        if abs(value) < 0.01:
+            motor.stop()
+        elif value > 0:
+            motor.forward(value)
+        else:
+            motor.backward(-value)
 
-    def stop(self):
+    def stop(self) -> None:
         self.motor1.stop()
         self.motor2.stop()
 
 
 # ──────────────────────────────────────────────────────────────
-# Arm helpers
+# Robot Arm helpers
 # ──────────────────────────────────────────────────────────────
 
 JOINT_KEYS = [
@@ -191,112 +250,185 @@ JOINT_KEYS = [
     "gripper.pos",
 ]
 
-PRESET_SPEED_DEG_PER_SEC = 50.0
-PRESET_STEP_HZ           = 50
+PRESET_SPEED_DEG_PER_SEC = 50.0   # max joint speed during preset interpolation
+PRESET_STEP_HZ           = 50     # interpolation tick rate (steps per second)
 
 
 def send_action_preset(robot_arm, action_dict: dict) -> float:
+    """
+    Execute a preset action with smooth interpolation so no joint moves faster than PRESET_SPEED_DEG_PER_SEC.
+
+    Returns total wall time taken (for stats).
+    """
     t0 = time.perf_counter()
+
+    
+    phase_target = {k: v for k, v in action_dict.items()}
+    if not phase_target:
+        return
+
+    # Read current joint positions from the robot_arm.
     try:
-        obs         = robot_arm.get_observation()
-        phase_start = {k: float(obs[k]) for k in action_dict if k in obs}
+        obs = robot_arm.get_observation()
+        phase_start = {k: float(obs[k]) for k in phase_target if k in obs}
     except Exception:
         phase_start = {}
+
+    # Fall back to jumping straight to target if observation unavailable.
     if not phase_start:
-        robot_arm.send_action(action_dict)
-        return time.perf_counter() - t0
+        robot_arm.send_action(phase_target)
+        return
+
+    # Number of steps driven by the largest joint displacement.
     step_dt   = 1.0 / PRESET_STEP_HZ
-    max_delta = max(abs(action_dict[k] - phase_start[k]) for k in action_dict)
-    steps     = max(1, int(np.ceil(max_delta / (PRESET_SPEED_DEG_PER_SEC * step_dt))))
-    for i in range(1, steps + 1):
-        alpha = i / steps
-        robot_arm.send_action({
-            k: phase_start[k] + alpha * (action_dict[k] - phase_start[k])
-            for k in action_dict
-        })
+    max_delta = max(abs(phase_target[k] - phase_start[k]) for k in phase_target)
+    min_steps = max(1, int(np.ceil(max_delta / (PRESET_SPEED_DEG_PER_SEC * step_dt))))
+
+    for i in range(1, min_steps + 1):
+        alpha = i / min_steps
+        step_cmd = {
+            k: phase_start[k] + alpha * (phase_target[k] - phase_start[k])
+            for k in phase_target
+        }
+        robot_arm.send_action(step_cmd)
         time.sleep(step_dt)
+
     return time.perf_counter() - t0
 
 
 def connect_robot_arm(arm_port: str, robot_id: str):
+    """Connect to SO-101 arm. Returns robot instance or None on failure."""
     if not ARM_AVAILABLE:
         print("ℹ️  lerobot not available — arm disabled")
         return None
     try:
-        config    = SO101FollowerConfig(port=arm_port, id=robot_id)
+        print(f"  Connecting to SO-101 on {arm_port} (id={robot_id}) …")
+        config = SO101FollowerConfig(port=arm_port, id=robot_id)
         robot_arm = SO101Follower(config)
         robot_arm.connect()
         print("✓ Arm connected.")
         return robot_arm
     except Exception as e:
-        print(f"⚠️  Could not connect to arm: {e}")
+        print(f"⚠️  Could not connect to arm: {e}  — arm control disabled")
         return None
 
 
+def get_observation_dict(robot) -> dict:
+    """Return all scalar observations as a plain Python dict (JSON-serialisable)."""
+    obs = robot.get_observation()
+    return {
+        k: float(v) if hasattr(v, "item") else v
+        for k, v in obs.items()
+        if not k.startswith("observation.image")
+    }
+
+
 # ──────────────────────────────────────────────────────────────
-# Camera helpers
+# Dataset recording helpers
 # ──────────────────────────────────────────────────────────────
 
 def _parse_camera_spec(camera_spec: str) -> dict:
-    spec   = camera_spec.strip().strip("{}")
+    """
+    Parse lerobot-style camera spec into {name: {key: value}} dict.
+
+    Input format (same as lerobot-record --robot.cameras):
+        { front: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30},
+          base:  {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30}}
+
+    Strategy: strip braces/whitespace, split on camera boundaries, then split
+    each camera's key-value pairs. No regex, no JSON conversion needed.
+    """
+    spec = camera_spec.strip().strip("{}")
+    cameras = {}
+
+    # Split into per-camera blocks by finding "name: {....}" segments
+    # We walk character-by-character to split on top-level commas (outside braces)
     blocks = []
-    depth, current = 0, ""
+    depth = 0
+    current = ""
     for ch in spec:
-        if ch == "{": depth += 1
-        elif ch == "}": depth -= 1
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
         if ch == "," and depth == 0:
-            blocks.append(current.strip()); current = ""
+            blocks.append(current.strip())
+            current = ""
         else:
             current += ch
     if current.strip():
         blocks.append(current.strip())
-    cameras = {}
+
     for block in blocks:
-        colon = block.index(":")
-        name  = block[:colon].strip().strip("\"'")
-        inner = block[colon+1:].strip().strip("{}")
-        cfg   = {}
-        pairs, depth, current = [], 0, ""
+        # Split "name: { key: val, key: val }" into name and inner dict
+        colon_pos = block.index(":")
+        name = block[:colon_pos].strip().strip("\"'")
+        inner = block[colon_pos+1:].strip().strip("{}")
+
+        # Parse inner key:value pairs (same depth-aware split)
+        cfg = {}
+        pairs = []
+        depth = 0
+        current = ""
         for ch in inner:
             if ch == "{": depth += 1
             elif ch == "}": depth -= 1
             if ch == "," and depth == 0:
-                pairs.append(current.strip()); current = ""
+                pairs.append(current.strip())
+                current = ""
             else:
                 current += ch
         if current.strip():
             pairs.append(current.strip())
+
         for pair in pairs:
-            if ":" not in pair: continue
+            if ":" not in pair:
+                continue
             k, v = pair.split(":", 1)
             cfg[k.strip().strip("\"'")] = v.strip().strip("\"'")
+
         cameras[name] = cfg
+
     return cameras
 
 
 def connect_cameras(camera_spec: str) -> dict:
-    if not camera_spec or not CAMERAS_AVAILABLE:
-        return {}
+    """
+    Parse lerobot-style camera spec and connect each OpenCVCamera.
+    Returns {name: OpenCVCamera}.
+
+    Accepts the same format as lerobot-record --robot.cameras:
+        "{ front: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30},
+           base:  {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30}}"
+    """
+    cameras = {}
+    if not camera_spec or not RECORDING_AVAILABLE:
+        return cameras
+
     try:
         parsed = _parse_camera_spec(camera_spec)
     except Exception as e:
         print(f"⚠️  Could not parse --cameras spec: {e}")
-        return {}
-    cameras = {}
+        return cameras
+
     for name, cfg_dict in parsed.items():
         try:
             raw_path = cfg_dict.get("index_or_path", "0")
+            # Convert /dev/videoN → integer index (most reliable with lerobot)
             if str(raw_path).lstrip("-").isdigit():
                 index = int(raw_path)
             elif str(raw_path).startswith("/dev/video"):
                 index = int(raw_path.replace("/dev/video", ""))
             else:
                 index = raw_path
+
             kwargs = {"index_or_path": index}
             if "width"  in cfg_dict: kwargs["width"]  = int(cfg_dict["width"])
             if "height" in cfg_dict: kwargs["height"] = int(cfg_dict["height"])
             if "fps"    in cfg_dict: kwargs["fps"]    = int(cfg_dict["fps"])
-            cam = OpenCVCamera(OpenCVCameraConfig(**kwargs))
+
+            cfg = OpenCVCameraConfig(**kwargs)
+            cam = OpenCVCamera(cfg)
             cam.connect()
             cameras[name] = cam
             print(f"✓ Camera '{name}' connected ({raw_path})")
@@ -305,30 +437,88 @@ def connect_cameras(camera_spec: str) -> dict:
     return cameras
 
 
-def encode_image_jpeg(img: np.ndarray, quality: int = 70) -> str:
-    if not CV2_AVAILABLE or img is None:
-        return ""
-    ok, buf = cv2.imencode(
-        ".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
-        [cv2.IMWRITE_JPEG_QUALITY, quality]
-    )
-    return base64.b64encode(buf.tobytes()).decode("ascii") if ok else ""
+def build_dataset(repo_id: str, fps: int, cameras: dict) -> "LeRobotDataset | None":
+    """Create or resume a LeRobotDataset. repo_id must already be clean."""
+    if not RECORDING_AVAILABLE:
+        return None
+    try:
+        import shutil
+        local_root = Path.home() / ".cache" / "huggingface" / "lerobot" / repo_id
+        meta_file  = local_root / "meta" / "info.json"
+
+        if local_root.exists():
+            if meta_file.exists():
+                print(f"  Resuming existing dataset at {local_root} …")
+                try:
+                    ds = LeRobotDataset(repo_id=repo_id, root=local_root)
+                    print(f"✓ Dataset '{repo_id}' resumed ({ds.num_episodes} existing episodes)")
+                    return ds
+                except Exception as resume_err:
+                    if "must be tagged with a codebase version" in str(resume_err):
+                        # Hub repo exists but has no version tag (dataset never pushed).
+                        # This only triggers when there are no local parquet files, so it
+                        # is safe to delete and recreate the local metadata directory.
+                        print(f"  No Hub version tag — recreating local dataset …")
+                        shutil.rmtree(local_root)
+                    else:
+                        raise
+            else:
+                print(f"  Removing incomplete dataset directory: {local_root}")
+                shutil.rmtree(local_root)
+
+        n = len(JOINT_KEYS)
+        features = {
+            # Packed state vector (6,) — actual reported joint positions
+            "observation.state": {"dtype": "float32", "shape": (n,), "names": JOINT_KEYS},
+            # Packed action vector (6,) — commanded joint positions (what lerobot-replay reads)
+            "action":            {"dtype": "float32", "shape": (n,), "names": JOINT_KEYS},
+        }
+        for name in cameras:
+            features[f"observation.images.{name}"] = {
+                "dtype": "video", "shape": (480, 640, 3),
+                "names": ["height", "width", "channel"],
+            }
+        ds = LeRobotDataset.create(repo_id=repo_id, fps=fps, root=local_root, features=features)
+        print(f"✓ Dataset '{repo_id}' created  (local: {local_root})")
+        return ds
+    except Exception as e:
+        print(f"⚠️  Dataset creation failed: {e}")
+        return None
+
+
+def kb_ready() -> bool:
+    """Non-blocking check for keyboard input on stdin."""
+    return select.select([sys.stdin], [], [], 0)[0] != []
 
 
 class CameraBuffer:
-    """Background-thread camera capture — always holds the latest frame."""
+    """
+    Runs each camera in its own background thread, always holding the
+    latest frame. The control loop calls get_latest() which returns
+    instantly without ever waiting on the camera hardware.
+
+    Usage:
+        buf = CameraBuffer(cameras)   # cameras = {name: OpenCVCamera}
+        buf.start()
+        frame = buf.get_latest()      # {name: np.ndarray} — never blocks
+        buf.stop()
+    """
+
     def __init__(self, cameras: dict):
         self._cameras  = cameras
-        self._frames   = {n: None for n in cameras}
+        self._frames   : dict[str, np.ndarray | None] = {n: None for n in cameras}
         self._lock     = threading.Lock()
         self._stop_evt = threading.Event()
+        self._threads  : list[threading.Thread] = []
 
-    def start(self):
+    def start(self) -> None:
         for name, cam in self._cameras.items():
-            t = threading.Thread(target=self._loop, args=(name, cam), daemon=True)
+            t = threading.Thread(target=self._capture_loop, args=(name, cam),
+                                 daemon=True, name=f"cam-{name}")
             t.start()
+            self._threads.append(t)
 
-    def _loop(self, name, cam):
+    def _capture_loop(self, name: str, cam) -> None:
         while not self._stop_evt.is_set():
             try:
                 img = cam.read()
@@ -336,13 +526,14 @@ class CameraBuffer:
                     with self._lock:
                         self._frames[name] = img
             except Exception:
-                pass
+                pass   # keep running even if one frame fails
 
     def get_latest(self) -> dict:
+        """Return a shallow copy of the latest frames dict. Never blocks."""
         with self._lock:
             return dict(self._frames)
 
-    def stop(self):
+    def stop(self) -> None:
         self._stop_evt.set()
 
 
@@ -351,102 +542,272 @@ class CameraBuffer:
 # ──────────────────────────────────────────────────────────────
 
 def handle_client(
-    conn:       socket.socket,
+    conn: socket.socket,
     robot_arm,
-    motors:     "MotorController | None",
-    cam_buffer: "CameraBuffer | None",
-    verbose:    bool,
-    jpeg_quality: int = 70,
+    motors: "MotorController | None",
+    verbose: bool,
+    # ── recording (all None = teleoperation-only mode, original behaviour) ──
+    dataset: "LeRobotDataset | None" = None,
+    cameras: dict | None = None,
+    cam_buffer: "CameraBuffer | None" = None,
+    task: str = "",
+    num_episodes: int = 0,
+    episode_time_s: float = 60.0,
+    reset_time_s: float = 30.0,
 ) -> None:
     stats        = ServerStats()
-    current_mode = None
+    cameras      = cameras or {}
+    recording    = dataset is not None and num_episodes > 0
+
+    # ── per-episode state ─────────────────────────────────────────────────
+    current_mode  : str | None = None   # tracks "arm" | "motor" | None
+    ep_frames     : list[dict] = []
+    ep_start      : float      = 0.0
+    episode_idx   : int        = 0
+    in_episode    : bool       = False  # True while actively recording an episode
+
+    def start_episode() -> None:
+        nonlocal ep_frames, ep_start, in_episode
+        ep_frames  = []
+        ep_start   = time.perf_counter()
+        in_episode = True
+        print(f"\n{'─'*50}")
+        print(f"  Episode {episode_idx + 1}/{num_episodes}  —  {task}")
+        print(f"  Enter=save  r+Enter=rerecord  q+Enter=quit")
+        print(f"{'─'*50}")
+
+    def save_episode() -> bool:
+        """Commit buffered frames to dataset. Returns True if saved."""
+        nonlocal episode_idx, in_episode
+        in_episode = False
+        if not ep_frames:
+            print("  No frames captured — discarding.")
+            return False
+        print(f"  Saving {len(ep_frames)} frames …", end=" ", flush=True)
+        for frame in ep_frames:
+            dataset.add_frame(frame)
+        dataset.save_episode()
+        episode_idx += 1
+        print(f"✓  ({episode_idx}/{num_episodes})")
+        return True
+
+    def discard_episode() -> None:
+        nonlocal in_episode
+        in_episode = False
+        print(f"  Discarding episode ({len(ep_frames)} frames)")
+
+    def do_reset_pause() -> None:
+        """Pause between episodes; keep serving arm commands during the wait."""
+        print(f"\n  Reset the environment — {reset_time_s:.0f}s  (Enter to skip)")
+        end_t = time.perf_counter() + reset_time_s
+        while time.perf_counter() < end_t:
+            if kb_ready():
+                sys.stdin.readline()
+                break
+            conn.settimeout(0.05)
+            try:
+                m = recv_msg(conn)
+                # Forward arm/motor commands during reset but don't record them
+                _dispatch_msg(m, record=False)
+            except socket.timeout:
+                pass
+            except Exception:
+                break
+            finally:
+                conn.settimeout(None)
+
+    def check_keyboard() -> str:
+        """Returns 'save', 'rerecord', 'quit', or '' if nothing pressed."""
+        if not kb_ready():
+            return ""
+        ch = sys.stdin.readline().strip().lower()
+        if ch == "":   return "save"
+        if ch == "r":  return "rerecord"
+        if ch == "q":  return "quit"
+        return ""
+
+    def _dispatch_msg(msg: dict, record: bool) -> None:
+        """
+        Core message dispatcher — identical logic to the original handle_client,
+        with recording hooks added into the action branch.
+        `record=False` during reset/non-arm modes so those frames are skipped.
+        """
+        nonlocal current_mode, in_episode, episode_idx
+
+        mtype = msg.get("type")
+
+        # ── mode_request ─────────────────────────────────────────────────
+        # Client tapped RB or LB — check if that mode is available and reply
+        if mtype == "mode_request":
+            requested = msg.get("mode")
+            if requested == "arm":
+                ok     = robot_arm is not None
+                reason = "arm not connected" if not ok else ""
+            elif requested == "motor":
+                ok     = motors is not None
+                reason = "motors not connected" if not ok else ""
+            else:
+                ok     = False
+                reason = f"unknown mode '{requested}'"
+            send_msg(conn, {"type": "mode_response", "mode": requested, "ok": ok, "reason": reason})
+            if ok:
+                current_mode = requested
+            print(f"[server] mode_request '{requested}' → {'granted' if ok else f'denied ({reason})'}")
+
+        # ── action (arm) ─────────────────────────────────────────────────
+        elif mtype == "action":
+            if robot_arm is not None:
+                action_dict: dict = msg["action"]   # {joint_key: float, …}
+                is_preset: bool   = msg.get("preset", False)
+                recv_t = time.perf_counter()
+                t0     = time.perf_counter()
+                if is_preset:
+                        # Phase 1: shoulder_pan, shoulder_lift, elbow_flex
+                        # Phase 2: wrist_flex, wrist_roll, gripper
+                        # Pause between phases lets the arm clear collisions.
+                    send_action_preset(robot_arm, action_dict)
+                else:
+                    robot_arm.send_action(action_dict)
+                exec_s = time.perf_counter() - t0
+                stats.record_action(recv_t, exec_s)
+                stats.maybe_print()
+                if verbose:
+                    kind = "preset" if is_preset else "continuous"
+                    vals = [f"{action_dict.get(k, 0):.1f}" for k in JOINT_KEYS]
+                    print(f"[server] action({kind}) exec={exec_s*1000:.2f}ms  pos={vals}")
+
+                # ── recording hook ────────────────────────────────────────
+                # Only record continuous arm actions (not presets, not motor mode)
+                if record and in_episode and current_mode == "arm" and not is_preset:
+                    try:
+                        # action  = positions commanded by the client
+                        # observation.state = positions the arm actually reported (fresh serial read)
+                        action_vals = np.array(
+                            [float(action_dict.get(k, 0.0)) for k in JOINT_KEYS],
+                            dtype=np.float32,
+                        )
+                        raw_obs = robot_arm.get_observation()
+                        obs_vals = np.array(
+                            [float(raw_obs.get(k, 0.0)) for k in JOINT_KEYS],
+                            dtype=np.float32,
+                        )
+                        frame: dict = {
+                            "task":              task,
+                            "action":            action_vals,
+                            "observation.state": obs_vals,
+                        }
+                        # Camera frames come from background buffer — never blocks
+                        if cam_buffer is not None:
+                            for cam_name, img in cam_buffer.get_latest().items():
+                                if img is not None:
+                                    frame[f"observation.images.{cam_name}"] = img
+                        ep_frames.append(frame)
+                    except Exception as _e:
+                        if verbose:
+                            print(f"[server] recording error: {_e}")
+            else:
+                if verbose:
+                    print("[server] action msg received but arm not connected — ignoring")
+
+        # ── motor ────────────────────────────────────────────────────────
+        elif mtype == "motor":
+            if motors is not None:
+                m1 = float(msg.get("motor1", 0.0))
+                m2 = float(msg.get("motor2", 0.0))
+                motors.set(m1, m2)
+                if verbose:
+                    print(f"[server] motor  m1={m1:+.2f}  m2={m2:+.2f}")
+            else:
+                if verbose:
+                    print("[server] motor msg received but motors not connected — ignoring")
+
+        # ── ping → pong ──────────────────────────────────────────────────
+        elif mtype == "ping":
+            stats.record_ping()
+            send_msg(conn, {"type": "pong", "seq": msg.get("seq")})
+
+        # ── observation request (joint state only) ──────────────────────
+        elif mtype == "obs_request":
+            if robot_arm is not None:
+                obs = get_observation_dict(robot_arm)
+                send_msg(conn, {"type": "obs", "data": obs})
+            else:
+                send_msg(conn, {"type": "obs", "data": {}, "error": "arm not connected"})
+
+        # ── full observation request (joint state + camera images) ───────
+        elif mtype == "full_obs_request":
+            resp: dict = {"type": "full_obs", "images": {}}
+            if robot_arm is not None:
+                obs_dict = get_observation_dict(robot_arm)
+                resp["state"] = [float(obs_dict.get(k, 0.0)) for k in JOINT_KEYS]
+            if msg.get("images") and cam_buffer is not None and _CV2_AVAILABLE:
+                for cam_name, img in cam_buffer.get_latest().items():
+                    if img is not None:
+                        try:
+                            # OpenCVCamera returns RGB; imencode expects BGR
+                            bgr = _cv2.cvtColor(img, _cv2.COLOR_RGB2BGR)
+                            _, buf = _cv2.imencode(
+                                ".jpg", bgr, [_cv2.IMWRITE_JPEG_QUALITY, 70]
+                            )
+                            resp["images"][cam_name] = base64.b64encode(buf).decode("ascii")
+                        except Exception:
+                            pass
+            send_msg(conn, resp)
+
+        # ── graceful disconnect ──────────────────────────────────────────
+        elif mtype == "disconnect":
+            print("[server] Client requested disconnect.")
+            raise ConnectionError("client disconnect")
+
+        else:
+            print(f"[server] Unknown message type: {mtype!r}")
+
+    # ── main loop ─────────────────────────────────────────────────────────
+    if recording:
+        print(f"\n[server] Recording mode: {num_episodes} episodes  task='{task}'")
+        print(f"[server] Tap RB on the gamepad to enter ARM mode, then start teleoperating.")
+        start_episode()
 
     try:
         while True:
-            msg   = recv_msg(conn)
-            mtype = msg.get("type")
+            msg = recv_msg(conn)
 
-            # ── full_obs_request ──────────────────────────────────────
-            if mtype == "full_obs_request":
-                state_vals: list[float] = []
-                if robot_arm is not None:
-                    try:
-                        obs        = robot_arm.get_observation()
-                        state_vals = [float(obs.get(k, 0.0)) for k in JOINT_KEYS]
-                    except Exception as e:
-                        if verbose:
-                            print(f"[server] obs read error: {e}")
+            _dispatch_msg(msg, record=recording)
 
-                # Client sets "images": false during chunk execution to skip
-                # encoding — only the first step of each chunk needs fresh images.
-                want_images = msg.get("images", True)
-                images: dict[str, str] = {}
-                if want_images and cam_buffer is not None:
-                    for cam_name, img in cam_buffer.get_latest().items():
-                        if img is not None:
-                            images[cam_name] = encode_image_jpeg(img, jpeg_quality)
+            if not recording:
+                continue
 
-                send_msg(conn, {"type": "full_obs", "state": state_vals, "images": images})
+            # ── episode stop checks (only while recording) ────────────────
+            kb = check_keyboard()
+            timed_out = in_episode and (time.perf_counter() - ep_start >= episode_time_s)
 
-            # ── action ───────────────────────────────────────────────
-            elif mtype == "action":
-                if robot_arm is not None:
-                    action_dict: dict = msg["action"]
-                    is_preset: bool   = msg.get("preset", False)
-                    recv_t = time.perf_counter()
-                    t0     = time.perf_counter()
-                    if is_preset:
-                        send_action_preset(robot_arm, action_dict)
-                    else:
-                        robot_arm.send_action(action_dict)
-                    exec_s = time.perf_counter() - t0
-                    stats.record_action(recv_t, exec_s)
-                    stats.maybe_print()
-                    if stats._total_actions <= 3 or verbose:
-                        vals = [f"{action_dict.get(k, 0):.2f}" for k in JOINT_KEYS]
-                        print(f"[server] action #{stats._total_actions} exec={exec_s*1000:.2f}ms  pos={vals}")
-                else:
-                    if verbose:
-                        print("[server] action received but arm not connected — ignoring")
+            if timed_out:
+                print(f"\n  Episode time reached ({episode_time_s:.0f}s) — saving.")
+                kb = "save"
 
-            # ── mode_request (kept for gamepad client compatibility) ──
-            elif mtype == "mode_request":
-                requested = msg.get("mode")
-                if requested == "arm":
-                    ok, reason = (True, "") if robot_arm else (False, "arm not connected")
-                elif requested == "motor":
-                    ok, reason = (True, "") if motors else (False, "motors not connected")
-                else:
-                    ok, reason = False, f"unknown mode '{requested}'"
-                send_msg(conn, {"type": "mode_response", "mode": requested,
-                                "ok": ok, "reason": reason})
-                if ok:
-                    current_mode = requested
+            if kb == "save":
+                save_episode()
+                if episode_idx >= num_episodes:
+                    print("\n[server] All episodes recorded.")
+                    break
+                do_reset_pause()
+                start_episode()
 
-            # ── motor ────────────────────────────────────────────────
-            elif mtype == "motor":
-                if motors is not None:
-                    motors.set(float(msg.get("motor1", 0.0)), float(msg.get("motor2", 0.0)))
+            elif kb == "rerecord":
+                discard_episode()
+                start_episode()
 
-            # ── ping → pong ──────────────────────────────────────────
-            elif mtype == "ping":
-                stats.record_ping()
-                send_msg(conn, {"type": "pong", "seq": msg.get("seq")})
-
-            # ── disconnect ───────────────────────────────────────────
-            elif mtype == "disconnect":
-                print("[server] Client requested disconnect.")
+            elif kb == "quit":
+                discard_episode()
+                print("[server] Recording stopped early by user.")
                 break
-
-            else:
-                if verbose:
-                    print(f"[server] Unknown message type: {mtype!r}")
 
     except ConnectionError as e:
         print(f"[server] Connection lost: {e}")
     finally:
         if motors is not None:
             motors.stop()
+            print("[server] Motors stopped.")
         stats.print_summary()
         conn.close()
         print("[server] Client connection closed.")
@@ -458,81 +819,115 @@ def handle_client(
 
 def main():
     parser = argparse.ArgumentParser(
-        description=(
-            "SO-101 inference server (Raspberry Pi)\n\n"
-            "Connects the arm and cameras, then serves observations and\n"
-            "executes actions sent by the inference client.\n\n"
-            "Example:\n"
-            "  python lerobot_inference_server.py \\\n"
-            "    --arm-port /dev/ttyACM0 \\\n"
-            "    --cameras \"{ front: {type: opencv, index_or_path: /dev/video0,"
-            " width: 640, height: 480, fps: 15}}\""
-        ),
+        description="SO-101 + motor TCP server (Raspberry Pi)\n"
+                    "Run with arm only, motors only, or both — any combination is valid.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--host",          default="0.0.0.0")
-    parser.add_argument("--tcp-port",      type=int, default=2222)
-    parser.add_argument("--verbose",       action="store_true")
+    # TCP
+    parser.add_argument("--host",      default="0.0.0.0",      help="Bind address (default: 0.0.0.0)")
+    parser.add_argument("--tcp-port",  type=int, default=2222,  help="TCP port (default: 2222)")
+    parser.add_argument("--verbose",   action="store_true",     help="Print every action/motor command")
     # Arm
-    parser.add_argument("--no-arm",        action="store_true")
-    parser.add_argument("--arm-port",      default="/dev/ttyACM0")
-    parser.add_argument("--robot-id",      default="so101_follower")
-    # Cameras
+    parser.add_argument("--no-arm",    action="store_true",     help="Disable arm (motors only)")
+    parser.add_argument("--arm-port",   default="/dev/ttyACM0",  help="Serial port for SO-101 (default: /dev/ttyACM0)")
+    parser.add_argument("--robot-id",  default="so101_follower")
+    # Motors
+    parser.add_argument("--no-motors", action="store_true",     help="Disable motors (arm only)")
+    parser.add_argument("--m1-fwd",    type=int, default=17,    help="Motor 1 forward GPIO / IN1 (default: 17)")
+    parser.add_argument("--m1-bwd",    type=int, default=18,    help="Motor 1 backward GPIO / IN2 (default: 18)")
+    parser.add_argument("--m1-en",     type=int, default=25,    help="Motor 1 enable GPIO / ENA (default: 25)")
+    parser.add_argument("--m2-fwd",    type=int, default=22,    help="Motor 2 forward GPIO / IN3 (default: 22)")
+    parser.add_argument("--m2-bwd",    type=int, default=23,    help="Motor 2 backward GPIO / IN4 (default: 23)")
+    parser.add_argument("--m2-en",     type=int, default=24,    help="Motor 2 enable GPIO / ENB (default: 24)")
+    # Dataset recording (all optional — omit --repo-id to run without recording)
+    parser.add_argument("--repo-id",       default=None,
+                        help="HuggingFace repo id, e.g. ${HF_USER}/sock-grab")
+    parser.add_argument("--task",          default="Teleoperate the robot arm",
+                        help="Task description saved in the dataset")
+    parser.add_argument("--num-episodes",  type=int,   default=10,
+                        help="Number of episodes to record (default: 10)")
+    parser.add_argument("--episode-time",  type=float, default=60.0,
+                        help="Max seconds per episode (default: 60)")
+    parser.add_argument("--reset-time",    type=float, default=30.0,
+                        help="Seconds between episodes for env reset (default: 30)")
+    parser.add_argument("--fps",           type=int,   default=30,
+                        help="Dataset FPS (default: 30)")
     parser.add_argument("--cameras",       default="",
-                        help="lerobot-style camera spec")
-    parser.add_argument("--image-quality", type=int, default=70,
-                        help="JPEG quality sent to client (1-100, default: 70)")
-    # Motors (optional)
-    parser.add_argument("--no-motors",  action="store_true")
-    parser.add_argument("--m1-fwd",     type=int, default=17)
-    parser.add_argument("--m1-bwd",     type=int, default=18)
-    parser.add_argument("--m1-en",      type=int, default=25)
-    parser.add_argument("--m2-fwd",     type=int, default=22)
-    parser.add_argument("--m2-bwd",     type=int, default=23)
-    parser.add_argument("--m2-en",      type=int, default=24)
+                        help="Camera spec: 'name:/dev/videoN,name2:/dev/videoM'")
+    parser.add_argument("--no-push",       action="store_true",
+                        help="Skip uploading dataset to HuggingFace Hub")
     args = parser.parse_args()
 
-    print("  SO-101 Inference Server")
-    print("=" * 45)
+    # Expand and validate repo_id once, up front
+    if args.repo_id:
+        import os
+        args.repo_id = os.path.expandvars(args.repo_id).strip()
+        if "/" not in args.repo_id:
+            parser.error(
+                f"--repo-id must be 'username/dataset-name', got: '{args.repo_id}'\n"
+                f"  Make sure HF_USER is set: export HF_USER=$(hf auth whoami | awk -F': *' 'NR==1 {{print $2}}')"
+            )
+        if not args.task:
+            parser.error("--task is required when --repo-id is given, e.g. --task=\"Grab the sock\"")
+
+
+    print("  SO-101 + Motor TCP Server")
+    print("=" * 55)
 
     # ── Arm ───────────────────────────────────────────────────
     robot_arm = None
     if args.no_arm:
-        print("ℹ️  Arm:     DISABLED (--no-arm)")
+        print("ℹ️  Arm:    DISABLED (--no-arm)")
     else:
         robot_arm = connect_robot_arm(args.arm_port, args.robot_id)
         if robot_arm is None:
-            print("ℹ️  Arm:     DISABLED (connection failed)")
+            print("ℹ️  Arm:    DISABLED (connection failed)")
         else:
-            print(f"✓  Arm:     ENABLED  ({args.arm_port})")
+            print(f"✓  Arm:    ENABLED  ({args.arm_port})")
 
-    # ── Cameras ───────────────────────────────────────────────
-    cameras    = {}
-    cam_buffer = None
-    if args.cameras:
-        cameras = connect_cameras(args.cameras)
-        if cameras:
-            cam_buffer = CameraBuffer(cameras)
-            cam_buffer.start()
-            print(f"✓  Cameras: {list(cameras.keys())}  (JPEG quality={args.image_quality})")
-    else:
-        print("ℹ️  Cameras: NONE (no --cameras given)")
-
-    # ── Motors (optional) ─────────────────────────────────────
+    # ── Motors ────────────────────────────────────────────────
     motors = None
-    if not args.no_motors and MOTORS_AVAILABLE:
+    if args.no_motors:
+        print("ℹ️  Motors: DISABLED (--no-motors)")
+    elif not MOTORS_AVAILABLE:
+        print("ℹ️  Motors: DISABLED (gpiozero/lgpio not available)")
+    else:
         try:
             motors = MotorController(
                 m1_forward=args.m1_fwd, m1_backward=args.m1_bwd, m1_enable=args.m1_en,
                 m2_forward=args.m2_fwd, m2_backward=args.m2_bwd, m2_enable=args.m2_en,
             )
-            print("✓  Motors:  ENABLED")
+            print(f"✓  Motors: ENABLED")
         except Exception as e:
-            print(f"⚠️  Motors:  DISABLED ({e})")
+            print(f"⚠️  Motors: DISABLED (init failed: {e})")
 
-    print("=" * 45)
+    # ── Dataset recording ─────────────────────────────────────
+    cameras    = {}
+    cam_buffer = None
+    dataset    = None
+    if args.repo_id:
+        if not RECORDING_AVAILABLE:
+            print("⚠️  Recording: DISABLED (lerobot dataset not available)")
+        else:
+            cameras = connect_cameras(args.cameras)
+            if cameras:
+                cam_buffer = CameraBuffer(cameras)
+                cam_buffer.start()
+                print(f"✓  Camera buffer started ({len(cameras)} cameras)")
+            dataset = build_dataset(args.repo_id, args.fps, cameras)
+            if dataset:
+                print(f"✓  Recording: ENABLED  → {args.repo_id}  "
+                      f"({args.num_episodes} episodes)")
+    else:
+        print("ℹ️  Recording: DISABLED (no --repo-id given)")
 
-    # ── TCP server ────────────────────────────────────────────
+    # ── Sanity check ──────────────────────────────────────────
+    if robot_arm is None and motors is None:
+        print("\n⚠️  WARNING: Neither arm nor motors are connected.")
+        print("   The server will run but all incoming commands will be ignored.")
+
+    # ── Start TCP server ──────────────────────────────────────
+    print("=" * 55)
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind((args.host, args.tcp_port))
@@ -545,21 +940,51 @@ def main():
             conn, addr = server_sock.accept()
             print(f"[server] Client connected from {addr}")
             handle_client(
-                conn, robot_arm, motors, cam_buffer,
-                verbose=args.verbose,
-                jpeg_quality=args.image_quality,
+                conn, robot_arm, motors, args.verbose,
+                dataset        = dataset,
+                cameras        = cameras,
+                cam_buffer     = cam_buffer,
+                task           = args.task,
+                num_episodes   = args.num_episodes if args.repo_id else 0,
+                episode_time_s = args.episode_time,
+                reset_time_s   = args.reset_time,
             )
+            # After all episodes are done, stop accepting new clients
+            if dataset is not None:
+                break
             print("[server] Ready for next client …")
     except KeyboardInterrupt:
         print("\n[server] Shutting down.")
     finally:
-        if motors:     motors.stop()
+        if motors is not None:
+            motors.stop()
         server_sock.close()
-        if robot_arm:  robot_arm.disconnect()
-        if cam_buffer: cam_buffer.stop()
+        if robot_arm is not None:
+            robot_arm.disconnect()
+        # ── Finalize and push dataset ─────────────────────────
+        if dataset is not None:
+            print("\n[server] Finalizing dataset …")
+            try:
+                dataset.finalize()
+            except Exception as e:
+                print(f"⚠️  Finalize failed: {e}")
+            if not args.no_push:
+                print("[server] Pushing to HuggingFace Hub …")
+                try:
+                    dataset.push_to_hub()
+                    print(f"✓ Uploaded → https://huggingface.co/datasets/{args.repo_id}")
+                except Exception as e:
+                    print(f"⚠️  Upload failed: {e}")
+                    local_root = Path.home() / ".cache" / "huggingface" / "lerobot" / args.repo_id
+                    print(f"   Push manually:")
+                    print(f"   huggingface-cli upload {args.repo_id} {local_root} --repo-type dataset")
+        if cam_buffer is not None:
+            cam_buffer.stop()
         for cam in cameras.values():
-            try: cam.disconnect()
-            except Exception: pass
+            try:
+                cam.disconnect()
+            except Exception:
+                pass
         print("[server] Clean exit.")
 
 
