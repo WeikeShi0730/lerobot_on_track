@@ -402,6 +402,18 @@ class SO101GamepadClient:
         # ── Observability ───────────────────────────────────────
         self.stats = ClientStats(control_frequency)
 
+        # Sync actual arm position from server so the first joystick delta is
+        # computed from where the arm really is, not the hardcoded HOME constant.
+        try:
+            send_msg(self.sock, {"type": "full_obs_request", "images": False})
+            resp = recv_msg(self.sock)
+            if resp.get("type") == "full_obs" and "state" in resp:
+                self.current_position = np.array(resp["state"], dtype=np.float32)
+                print(f"  ✓ Position synced from server: {np.round(self.current_position, 2)}")
+            else:
+                print(f"  ⚠️  No state in server response — using HOME as starting position")
+        except Exception as e:
+            print(f"  ⚠️  Initial position sync failed: {e} — using HOME as starting position")
         print(f"  Starting position: {np.round(self.current_position, 2)}")
 
     # ── Helpers ────────────────────────────────────────────────
@@ -544,6 +556,9 @@ class SO101GamepadClient:
             mtype = msg.get("type")
             if mtype == "pong":
                 self.stats.record_pong(msg)
+                # Correct dead-reckoning drift using the state piggybacked on pong
+                if "state" in msg:
+                    self.current_position = np.array(msg["state"], dtype=np.float32)
             elif mtype == "mode_response":
                 self._apply_mode_response(msg)
         except BlockingIOError:

@@ -791,16 +791,17 @@ def handle_client(
         # ── ping → pong ──────────────────────────────────────────────────
         elif mtype == "ping":
             stats.record_ping()
-            send_msg(conn, {"type": "pong", "seq": msg.get("seq")})
-
-        # ── observation request (joint state only) ──────────────────────
-        elif mtype == "obs_request":
+            pong: dict = {"type": "pong", "seq": msg.get("seq")}
+            # Piggyback current joint state so the client can keep its
+            # dead-reckoning position in sync without a separate round-trip.
             if robot_arm is not None:
-                with _arm_lock:
-                    obs = get_observation_dict(robot_arm)
-                send_msg(conn, {"type": "obs", "data": obs})
-            else:
-                send_msg(conn, {"type": "obs", "data": {}, "error": "arm not connected"})
+                try:
+                    with _arm_lock:
+                        obs_dict = get_observation_dict(robot_arm)
+                    pong["state"] = [float(obs_dict.get(k, 0.0)) for k in JOINT_KEYS]
+                except Exception:
+                    pass
+            send_msg(conn, pong)
 
         # ── full observation request (joint state + camera images) ───────
         elif mtype == "full_obs_request":
