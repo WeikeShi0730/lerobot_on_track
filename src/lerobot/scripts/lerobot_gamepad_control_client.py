@@ -257,7 +257,6 @@ PRESET_POSITIONS = {
     "home":     np.array([0.0,   -108.0,  95.0,   55.0,   -90.0,  0.0],  dtype=np.float32),
     "movement": np.array([0.3,   -85.7,   95.0,  -23.0,   -90.0,  0.0],  dtype=np.float32),
     "grab":     np.array([-12.3,   60.9,  -38.3,  73.0,   -90.0,  64.1],  dtype=np.float32),
-    # "drop":     np.array([0.7,    -3.9,  -72.2, -107.6,   -90.0, 0.0],  dtype=np.float32),
     "drop":     np.array([-2.5,   -30.0,  -98.0, -107.6,   90.0,  -3.3],  dtype=np.float32),
 }
 
@@ -514,7 +513,7 @@ class SO101GamepadClient:
             action[0] = left_x  * self.max_speed   # shoulder_pan
             action[1] = left_y  * self.max_speed   # shoulder_lift
             action[2] = right_y * self.max_speed   # elbow_flex
-            action[3] = hat_y   * self.max_speed   # wrist_flex
+            action[3] = -hat_y   * self.max_speed   # wrist_flex
             action[4] = hat_x   * self.max_speed   # wrist_roll
             if rt > 0.1:
                 action[5] = -rt * self.max_speed   # close gripper

@@ -39,6 +39,7 @@ Wire protocol (shared with client):
 
 import argparse
 import collections
+from contextlib import nullcontext as _nullcontext
 import json
 import select
 import socket
@@ -254,30 +255,39 @@ PRESET_SPEED_DEG_PER_SEC = 50.0   # max joint speed during preset interpolation
 PRESET_STEP_HZ           = 50     # interpolation tick rate (steps per second)
 
 
-def send_action_preset(robot_arm, action_dict: dict) -> float:
+def send_action_preset(robot_arm, action_dict: dict, lock=None, on_step=None) -> float:
     """
     Execute a preset action with smooth interpolation so no joint moves faster than PRESET_SPEED_DEG_PER_SEC.
+
+    lock:    optional threading.Lock guarding the servo bus.  When provided the lock
+             is held only during each send_action call (not during sleep), so the main
+             loop can serve full_obs_request between steps.
+    on_step: optional callable(step_cmd: dict, obs: dict) invoked after each
+             send_action while the lock is still held.  Used by the dataset recorder
+             to capture each interpolated step so presets don't create gaps in
+             the training trajectory.
 
     Returns total wall time taken (for stats).
     """
     t0 = time.perf_counter()
 
-    
     phase_target = {k: v for k, v in action_dict.items()}
     if not phase_target:
-        return
+        return 0.0
 
     # Read current joint positions from the robot_arm.
     try:
-        obs = robot_arm.get_observation()
+        with lock if lock else _nullcontext():
+            obs = robot_arm.get_observation()
         phase_start = {k: float(obs[k]) for k in phase_target if k in obs}
     except Exception:
         phase_start = {}
 
     # Fall back to jumping straight to target if observation unavailable.
     if not phase_start:
-        robot_arm.send_action(phase_target)
-        return
+        with lock if lock else _nullcontext():
+            robot_arm.send_action(phase_target)
+        return time.perf_counter() - t0
 
     # Number of steps driven by the largest joint displacement.
     step_dt   = 1.0 / PRESET_STEP_HZ
@@ -290,8 +300,23 @@ def send_action_preset(robot_arm, action_dict: dict) -> float:
             k: phase_start[k] + alpha * (phase_target[k] - phase_start[k])
             for k in phase_target
         }
-        robot_arm.send_action(step_cmd)
-        time.sleep(step_dt)
+        with lock if lock else _nullcontext():
+            robot_arm.send_action(step_cmd)
+            # Read observation and call on_step while the lock is still held —
+            # avoids a second lock acquisition and gives on_step a consistent
+            # (action, state) snapshot from the same serial transaction.
+            if on_step is not None:
+                try:
+                    raw = robot_arm.get_observation()
+                    obs_scalars = {
+                        k: float(v) if hasattr(v, "item") else float(v)
+                        for k, v in raw.items()
+                        if not k.startswith("observation.image")
+                    }
+                except Exception:
+                    obs_scalars = {}
+                on_step(step_cmd, obs_scalars)
+        time.sleep(step_dt)   # sleep ensures smooth and slow motion, sleep OUTSIDE lock so obs requests can slip through
 
     return time.perf_counter() - t0
 
@@ -559,6 +584,19 @@ def handle_client(
     cameras      = cameras or {}
     recording    = dataset is not None and num_episodes > 0
 
+    # _arm_lock: guards the physical servo bus (serial port).
+    #   Held only during each individual send_action / get_observation call (~5ms),
+    #   released during sleep() between preset steps so obs requests can slip through.
+    #   Prevents concurrent serial writes from the preset thread and the main loop.
+    _arm_lock    = threading.Lock()
+
+    # _preset_busy: signals that a preset MOTION SEQUENCE is in progress.
+    #   Unlike _arm_lock (which is free during sleep), this stays set for the entire
+    #   preset duration (seconds).  The main loop checks this — not _arm_lock — to
+    #   decide whether to skip continuous arm commands, because _arm_lock being free
+    #   between steps would otherwise let a conflicting position command sneak through.
+    _preset_busy = threading.Event()
+
     # ── per-episode state ─────────────────────────────────────────────────
     current_mode  : str | None = None   # tracks "arm" | "motor" | None
     ep_frames     : list[dict] = []
@@ -626,6 +664,35 @@ def handle_client(
         if ch == "q":  return "quit"
         return ""
 
+    def _append_frame(action_src: dict, obs_src: dict) -> None:
+        """Pack (action, obs, cameras) into a frame dict and append to ep_frames.
+
+        action_src: {joint_key: float} — commanded positions for this step
+        obs_src:    {joint_key: float} — reported positions read after the command;
+                    falls back to action_src values if a key is missing
+        """
+        try:
+            action_vals = np.array(
+                [float(action_src.get(k, 0.0)) for k in JOINT_KEYS], dtype=np.float32
+            )
+            obs_vals = np.array(
+                [float(obs_src.get(k, action_src.get(k, 0.0))) for k in JOINT_KEYS],
+                dtype=np.float32,
+            )
+            frame: dict = {
+                "task":              task,
+                "action":            action_vals,
+                "observation.state": obs_vals,
+            }
+            if cam_buffer is not None:
+                for cam_name, img in cam_buffer.get_latest().items():
+                    if img is not None:
+                        frame[f"observation.images.{cam_name}"] = img
+            ep_frames.append(frame)
+        except Exception as _e:
+            if verbose:
+                print(f"[server] recording error: {_e}")
+
     def _dispatch_msg(msg: dict, record: bool) -> None:
         """
         Core message dispatcher — identical logic to the original handle_client,
@@ -660,15 +727,36 @@ def handle_client(
                 action_dict: dict = msg["action"]   # {joint_key: float, …}
                 is_preset: bool   = msg.get("preset", False)
                 recv_t = time.perf_counter()
-                t0     = time.perf_counter()
                 if is_preset:
-                        # Phase 1: shoulder_pan, shoulder_lift, elbow_flex
-                        # Phase 2: wrist_flex, wrist_roll, gripper
-                        # Pause between phases lets the arm clear collisions.
-                    send_action_preset(robot_arm, action_dict)
+                    # Run in a background thread so the recv loop stays live and
+                    # can respond to full_obs_request while the arm is moving.
+                    def _preset_worker(ad=action_dict):
+                        try:
+                            def _record_step(step_cmd: dict, obs_scalars: dict) -> None:
+                                # Called for every interpolated step of this preset so the
+                                # dataset captures the full sweep trajectory.  Without this,
+                                # consecutive training frames would show the arm teleporting
+                                # across the preset motion, leaving inference without any
+                                # data for those intermediate states.
+                                if record and in_episode and current_mode == "arm":
+                                    _append_frame(step_cmd, obs_scalars)
+
+                            send_action_preset(
+                                robot_arm, ad, lock=_arm_lock,
+                                on_step=_record_step if recording else None,
+                            )
+                        finally:
+                            _preset_busy.clear()
+                    _preset_busy.set()
+                    threading.Thread(target=_preset_worker, daemon=True).start()
+                    exec_s = 0.0
                 else:
-                    robot_arm.send_action(action_dict)
-                exec_s = time.perf_counter() - t0
+                    if _preset_busy.is_set():
+                        return   # skip — don't send conflicting commands during preset
+                    t0 = time.perf_counter()
+                    with _arm_lock:
+                        robot_arm.send_action(action_dict)
+                    exec_s = time.perf_counter() - t0
                 stats.record_action(recv_t, exec_s)
                 stats.maybe_print()
                 if verbose:
@@ -677,34 +765,13 @@ def handle_client(
                     print(f"[server] action({kind}) exec={exec_s*1000:.2f}ms  pos={vals}")
 
                 # ── recording hook ────────────────────────────────────────
-                # Only record continuous arm actions (not presets, not motor mode)
+                # Only record continuous arm actions here.  Preset frames are
+                # captured step-by-step inside _preset_worker via on_step so
+                # the full sweep trajectory is in the dataset.
                 if record and in_episode and current_mode == "arm" and not is_preset:
-                    try:
-                        # action  = positions commanded by the client
-                        # observation.state = positions the arm actually reported (fresh serial read)
-                        action_vals = np.array(
-                            [float(action_dict.get(k, 0.0)) for k in JOINT_KEYS],
-                            dtype=np.float32,
-                        )
+                    with _arm_lock:
                         raw_obs = robot_arm.get_observation()
-                        obs_vals = np.array(
-                            [float(raw_obs.get(k, 0.0)) for k in JOINT_KEYS],
-                            dtype=np.float32,
-                        )
-                        frame: dict = {
-                            "task":              task,
-                            "action":            action_vals,
-                            "observation.state": obs_vals,
-                        }
-                        # Camera frames come from background buffer — never blocks
-                        if cam_buffer is not None:
-                            for cam_name, img in cam_buffer.get_latest().items():
-                                if img is not None:
-                                    frame[f"observation.images.{cam_name}"] = img
-                        ep_frames.append(frame)
-                    except Exception as _e:
-                        if verbose:
-                            print(f"[server] recording error: {_e}")
+                    _append_frame(action_dict, raw_obs)
             else:
                 if verbose:
                     print("[server] action msg received but arm not connected — ignoring")
@@ -729,7 +796,8 @@ def handle_client(
         # ── observation request (joint state only) ──────────────────────
         elif mtype == "obs_request":
             if robot_arm is not None:
-                obs = get_observation_dict(robot_arm)
+                with _arm_lock:
+                    obs = get_observation_dict(robot_arm)
                 send_msg(conn, {"type": "obs", "data": obs})
             else:
                 send_msg(conn, {"type": "obs", "data": {}, "error": "arm not connected"})
@@ -738,7 +806,8 @@ def handle_client(
         elif mtype == "full_obs_request":
             resp: dict = {"type": "full_obs", "images": {}}
             if robot_arm is not None:
-                obs_dict = get_observation_dict(robot_arm)
+                with _arm_lock:
+                    obs_dict = get_observation_dict(robot_arm)
                 resp["state"] = [float(obs_dict.get(k, 0.0)) for k in JOINT_KEYS]
             if msg.get("images") and cam_buffer is not None and _CV2_AVAILABLE:
                 for cam_name, img in cam_buffer.get_latest().items():
@@ -901,19 +970,24 @@ def main():
         except Exception as e:
             print(f"⚠️  Motors: DISABLED (init failed: {e})")
 
-    # ── Dataset recording ─────────────────────────────────────
+    # ── Cameras ───────────
     cameras    = {}
     cam_buffer = None
-    dataset    = None
+    if args.cameras:
+        cameras = connect_cameras(args.cameras)
+        if cameras:
+            cam_buffer = CameraBuffer(cameras)
+            cam_buffer.start()
+            print(f"✓  Camera buffer started ({len(cameras)} cameras)")
+    else:
+        print("ℹ️  Cameras: DISABLED (no --cameras given)")
+
+    # ── Dataset recording ─────────────────────────────────────
+    dataset = None
     if args.repo_id:
         if not RECORDING_AVAILABLE:
             print("⚠️  Recording: DISABLED (lerobot dataset not available)")
         else:
-            cameras = connect_cameras(args.cameras)
-            if cameras:
-                cam_buffer = CameraBuffer(cameras)
-                cam_buffer.start()
-                print(f"✓  Camera buffer started ({len(cameras)} cameras)")
             dataset = build_dataset(args.repo_id, args.fps, cameras)
             if dataset:
                 print(f"✓  Recording: ENABLED  → {args.repo_id}  "
