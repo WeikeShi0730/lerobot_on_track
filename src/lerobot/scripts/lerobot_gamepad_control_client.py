@@ -574,6 +574,9 @@ class SO101GamepadClient:
                 self.stats.record_pong(msg)
             elif mtype == "mode_response":
                 self._apply_mode_response(msg)
+            elif mtype == "preset_done":
+                if "state" in msg:
+                    self.current_position = np.array(msg["state"], dtype=np.float32)
         except BlockingIOError:
             pass
         except Exception:
@@ -590,23 +593,13 @@ class SO101GamepadClient:
             return
         try:
             send_msg(self.sock, {"type": "full_obs_request", "images": True})
-            # Read until we get full_obs; handle any queued pong/mode_response first.
-            while True:
-                resp  = recv_msg(self.sock)
-                rtype = resp.get("type")
-                if rtype == "full_obs":
-                    imgs = {}
-                    for cam_name, b64 in resp.get("images", {}).items():
-                        if b64:
-                            imgs[cam_name] = decode_image(b64)
-                    show_images(imgs)
-                    break
-                elif rtype == "pong":
-                    self.stats.record_pong(resp)
-                elif rtype == "mode_response":
-                    self._apply_mode_response(resp)
-                else:
-                    break   # unexpected — stop waiting to avoid blocking forever
+            resp = recv_msg(self.sock)
+            if resp.get("type") == "full_obs":
+                imgs = {}
+                for cam_name, b64 in resp.get("images", {}).items():
+                    if b64:
+                        imgs[cam_name] = decode_image(b64)
+                show_images(imgs)
         except Exception:
             pass
 
