@@ -749,6 +749,14 @@ def handle_client(
                             )
                         finally:
                             _preset_busy.clear()
+                            # Send final arm state so the client can re-sync
+                            # current_position and avoid jumping on next joystick input.
+                            try:
+                                with _arm_lock:
+                                    final_state = [float(robot_arm.get_observation().get(k, 0.0)) for k in JOINT_KEYS]
+                                send_msg(conn, {"type": "preset_done", "state": final_state})
+                            except Exception:
+                                pass
                     _preset_busy.set()
                     threading.Thread(target=_preset_worker, daemon=True).start()
                     exec_s = 0.0
