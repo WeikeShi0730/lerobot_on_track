@@ -980,6 +980,8 @@ def main():
                         help="Motor backend: Raspberry Pi GPIO or ESP32/Arduino USB serial bridge (default: gpio)")
     parser.add_argument("--motor-serial-port", default="/dev/ttyUSB0",
                         help="Serial port for --motor-backend=serial, e.g. /dev/ttyUSB0 or /dev/ttyACM0")
+    parser.add_argument("--motor-serial-baud", type=int, default=115200,
+                        help="Serial baud for --motor-backend=serial (default: 115200)")
     parser.add_argument("--m1-fwd",    type=int, default=16,    help="Motor 1 forward GPIO / IN1 (default: 16, physical pin 36)")
     parser.add_argument("--m1-bwd",    type=int, default=1,     help="Motor 1 backward GPIO / IN2 (default: 1, physical pin 28)")
     parser.add_argument("--m1-en",     type=int, default=12,    help="Motor 1 enable GPIO / ENA (default: 12, physical pin 32)")
@@ -1045,7 +1047,7 @@ def main():
     else:
         try:
             if args.motor_backend == "serial":
-                motors = SerialMotorController(args.motor_serial_port)
+                motors = SerialMotorController(args.motor_serial_port, args.motor_serial_baud)
             else:
                 motors = MotorController(
                     m1_forward=args.m1_fwd, m1_backward=args.m1_bwd, m1_enable=args.m1_en,
