@@ -607,6 +607,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 if wandb_logger:
                     wandb_log_dict = train_tracker.to_dict()
                     if output_dict:
+                        output_dict.pop("loss_per_dim", None)
                         wandb_log_dict.update(output_dict)
                     # Log sample weighting statistics if enabled
                     if sample_weighter is not None:
