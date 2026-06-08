@@ -51,7 +51,7 @@ try:
     from lerobot.policies.factory import make_policy, make_pre_post_processors
     from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
     from lerobot.processor.rename_processor import rename_stats
-    from lerobot.utils.control_utils import predict_action
+    from lerobot.common.control_utils import predict_action
     LEROBOT_AVAILABLE = True
 except ImportError as _e:
     print(f"⚠️  lerobot not found: {_e}")
