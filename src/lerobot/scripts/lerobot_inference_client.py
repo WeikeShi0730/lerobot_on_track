@@ -173,6 +173,7 @@ class PolicyRunner:
         dataset_repo_id: str,
         device: str = "cpu",
         actions_per_chunk: int | None = None,
+        temporal_ensemble_coeff: float | None = None,
         rename_map: dict[str, str] | None = None,
     ):
         if not LEROBOT_AVAILABLE:
@@ -205,6 +206,15 @@ class PolicyRunner:
             if not hasattr(cfg, "n_action_steps"):
                 raise ValueError(f"Policy config {type(cfg).__name__} does not support n_action_steps")
             cfg.n_action_steps = actions_per_chunk
+        if temporal_ensemble_coeff is not None:
+            if not hasattr(cfg, "temporal_ensemble_coeff"):
+                raise ValueError(
+                    f"Policy config {type(cfg).__name__} does not support temporal ensembling"
+                )
+            if not hasattr(cfg, "n_action_steps"):
+                raise ValueError(f"Policy config {type(cfg).__name__} does not support n_action_steps")
+            cfg.temporal_ensemble_coeff = temporal_ensemble_coeff
+            cfg.n_action_steps = 1
 
         print(f"  Loading dataset metadata from '{dataset_repo_id}' …")
         ds_meta = LeRobotDatasetMetadata(dataset_repo_id)
@@ -232,6 +242,11 @@ class PolicyRunner:
     def n_action_steps(self) -> int:
         """How many queue-pop steps between NN re-runs."""
         return getattr(getattr(self.policy, "config", None), "n_action_steps", 1)
+
+    @property
+    def temporal_ensemble_coeff(self) -> float | None:
+        """Temporal ensembling coefficient, if supported and enabled."""
+        return getattr(getattr(self.policy, "config", None), "temporal_ensemble_coeff", None)
 
     def reset(self):
         """Call at the start of each episode to clear recurrent / queued state."""
@@ -468,7 +483,13 @@ def run_inference(
     policy.reset()
 
     n_action_steps = policy.n_action_steps
-    print(f"Running inference at {fps} Hz  (n_action_steps={n_action_steps})")
+    temporal_ensemble_coeff = policy.temporal_ensemble_coeff
+    te_status = (
+        f", temporal_ensemble_coeff={temporal_ensemble_coeff}"
+        if temporal_ensemble_coeff is not None
+        else ""
+    )
+    print(f"Running inference at {fps} Hz  (n_action_steps={n_action_steps}{te_status})")
     print("Press Ctrl+C to stop.\n")
 
     # Absolute scheduler: each action is due at a fixed wall-clock time so
@@ -585,6 +606,8 @@ def main():
                         help="Control frequency in Hz (default: 30)")
     parser.add_argument("--actions-per-chunk", "--actions_per_chunk", type=int, default=None,
                         help="Override policy n_action_steps; 1 runs policy inference every control step")
+    parser.add_argument("--temporal-ensemble-coeff", "--temporal_ensemble_coeff", type=float, default=None,
+                        help="Enable ACT temporal ensembling with this coefficient; 0.01 matches ACT default")
     parser.add_argument("--rename-map", "--rename_map", type=parse_rename_map, default={},
                         help="JSON mapping from incoming/dataset observation keys to policy observation keys")
     parser.add_argument("--dry-run",     action="store_true",
@@ -604,6 +627,7 @@ def main():
         dataset_repo_id=args.dataset_repo_id,
         device=args.device,
         actions_per_chunk=args.actions_per_chunk,
+        temporal_ensemble_coeff=args.temporal_ensemble_coeff,
         rename_map=args.rename_map,
     )
 
