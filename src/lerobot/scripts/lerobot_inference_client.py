@@ -175,6 +175,7 @@ class PolicyRunner:
         actions_per_chunk: int | None = None,
         temporal_ensemble_coeff: float | None = None,
         rename_map: dict[str, str] | None = None,
+        task: str = "",
     ):
         if not LEROBOT_AVAILABLE:
             raise RuntimeError("lerobot is not installed")
@@ -223,6 +224,7 @@ class PolicyRunner:
         self.policy = make_policy(cfg, ds_meta=ds_meta, rename_map=rename_map)
         self.policy.eval()
         self.device = torch.device(device)
+        self.task = task
 
         # Build preprocessor/postprocessor — handles input normalisation and
         # output denormalisation using dataset stats, exactly as lerobot-record does.
@@ -273,6 +275,7 @@ class PolicyRunner:
             preprocessor=self.preprocessor,
             postprocessor=self.postprocessor,
             use_amp=(self.device.type == "cuda"),
+            task=self.task,
         )
         raw = action.cpu().numpy().flatten()  # .cpu() required: numpy cannot access GPU memory
         if len(raw) != len(JOINT_KEYS):
@@ -610,6 +613,8 @@ def main():
                         help="Enable ACT temporal ensembling with this coefficient; 0.01 matches ACT default")
     parser.add_argument("--rename-map", "--rename_map", type=parse_rename_map, default={},
                         help="JSON mapping from incoming/dataset observation keys to policy observation keys")
+    parser.add_argument("--task", default="",
+                        help="Language instruction to pass to VLA policies")
     parser.add_argument("--dry-run",     action="store_true",
                         help="Print actions without sending them to the robot")
     parser.add_argument("--show-images", action="store_true",
@@ -629,6 +634,7 @@ def main():
         actions_per_chunk=args.actions_per_chunk,
         temporal_ensemble_coeff=args.temporal_ensemble_coeff,
         rename_map=args.rename_map,
+        task=args.task,
     )
 
     print("\n" + "=" * 45)
