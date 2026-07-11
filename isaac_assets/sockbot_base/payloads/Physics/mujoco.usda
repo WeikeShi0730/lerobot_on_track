@@ -1,0 +1,199 @@
+#usda 1.0
+(
+    customLayerData = {
+        string creator = "URDF USD Converter v0.1.3"
+    }
+    defaultPrim = "sockbot_base"
+    doc = """Generated from Composed Stage of root layer C:\\Users\\vicsh\\AppData\\Local\\Temp\\tmphpyd121q\\sockbot_base.usdc
+
+
+Generated from Composed Stage of root layer C:\\Users\\vicsh\\AppData\\Local\\Temp\\urdf_import_sockbot_base_tffdq9oq\\usdex_sockbot_base\\sockbot_base.usdc
+
+
+Generated from Composed Stage of root layer C:\\Users\\vicsh\\AppData\\Local\\Temp\\urdf_import_sockbot_base_tffdq9oq\\temp_sockbot_base\\sockbot_base.usd
+
+
+Generated from Composed Stage of root layer C:\\Users\\vicsh\\Projects\\lerobot_on_track\\isaac_assets\\sockbot_base\\payloads\\base.usd
+"""
+    kilogramsPerUnit = 1
+    metersPerUnit = 1
+    subLayers = [
+        @./physics.usda@
+    ]
+    upAxis = "Z"
+)
+
+over "sockbot_base"
+{
+    over "Physics"
+    {
+        def MjcActuator "wheel_front_left_joint_actuator"
+        {
+            uniform double[] mjc:biasPrm = [0, 0, -0.05000000074505806, 0, 0, 0, 0, 0, 0, 0]
+            uniform token mjc:biasType = "affine"
+            uniform double mjc:forceRange:max = inf
+            uniform double mjc:forceRange:min = -inf
+            uniform double[] mjc:gainPrm = [0.05000000074505806, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            uniform token mjc:gainType = "fixed"
+            custom rel mjc:target
+            prepend rel mjc:target = </sockbot_base/Physics/wheel_front_left_joint>
+        }
+
+        def MjcActuator "wheel_front_right_joint_actuator"
+        {
+            uniform double[] mjc:biasPrm = [0, 0, -0.05000000074505806, 0, 0, 0, 0, 0, 0, 0]
+            uniform token mjc:biasType = "affine"
+            uniform double mjc:forceRange:max = inf
+            uniform double mjc:forceRange:min = -inf
+            uniform double[] mjc:gainPrm = [0.05000000074505806, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            uniform token mjc:gainType = "fixed"
+            custom rel mjc:target
+            prepend rel mjc:target = </sockbot_base/Physics/wheel_front_right_joint>
+        }
+
+        def MjcActuator "wheel_rear_left_joint_actuator"
+        {
+            uniform double[] mjc:biasPrm = [0, 0, -0.05000000074505806, 0, 0, 0, 0, 0, 0, 0]
+            uniform token mjc:biasType = "affine"
+            uniform double mjc:forceRange:max = inf
+            uniform double mjc:forceRange:min = -inf
+            uniform double[] mjc:gainPrm = [0.05000000074505806, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            uniform token mjc:gainType = "fixed"
+            custom rel mjc:target
+            prepend rel mjc:target = </sockbot_base/Physics/wheel_rear_left_joint>
+        }
+
+        def MjcActuator "wheel_rear_right_joint_actuator"
+        {
+            uniform double[] mjc:biasPrm = [0, 0, -0.05000000074505806, 0, 0, 0, 0, 0, 0, 0]
+            uniform token mjc:biasType = "affine"
+            uniform double mjc:forceRange:max = inf
+            uniform double mjc:forceRange:min = -inf
+            uniform double[] mjc:gainPrm = [0.05000000074505806, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            uniform token mjc:gainType = "fixed"
+            custom rel mjc:target
+            prepend rel mjc:target = </sockbot_base/Physics/wheel_rear_right_joint>
+        }
+
+        over "wheel_front_left_joint" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+        )
+        {
+        }
+
+        over "wheel_front_right_joint" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+        )
+        {
+        }
+
+        over "wheel_rear_left_joint" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+        )
+        {
+        }
+
+        over "wheel_rear_right_joint" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+        )
+        {
+        }
+
+        over "arm_mount_joint"
+        {
+        }
+
+        over "base_camera_joint"
+        {
+        }
+    }
+
+    over "Geometry"
+    {
+        over "base_link"
+        {
+            over "wheel_front_left"
+            {
+                over "cylinder"
+                {
+                }
+
+                over "cylinder_1"
+                {
+                }
+            }
+
+            over "wheel_front_right"
+            {
+                over "cylinder"
+                {
+                }
+
+                over "cylinder_1"
+                {
+                }
+            }
+
+            over "wheel_rear_left"
+            {
+                over "cylinder"
+                {
+                }
+
+                over "cylinder_1"
+                {
+                }
+            }
+
+            over "wheel_rear_right"
+            {
+                over "cylinder"
+                {
+                }
+
+                over "cylinder_1"
+                {
+                }
+            }
+
+            over "base_camera_link"
+            {
+                over "box"
+                {
+                }
+
+                over "box_1"
+                {
+                }
+            }
+
+            over "arm_mount_link"
+            {
+            }
+
+            over "box"
+            {
+            }
+
+            over "box_1"
+            {
+            }
+        }
+    }
+
+    over "Materials"
+    {
+        over "chassis_grey"
+        {
+        }
+
+        over "wheel_black"
+        {
+        }
+
+        over "camera_blue"
+        {
+        }
+    }
+}
+

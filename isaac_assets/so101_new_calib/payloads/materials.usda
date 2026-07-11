@@ -1,0 +1,90 @@
+#usda 1.0
+(
+    customLayerData = {
+        string creator = "URDF USD Converter v0.1.3"
+    }
+    doc = """Generated from Composed Stage of root layer C:\\Users\\vicsh\\AppData\\Local\\Temp\\tmp9ykd1p0p\\so101_new_calib.usdc
+
+
+Generated from Composed Stage of root layer C:\\Users\\vicsh\\AppData\\Local\\Temp\\urdf_import_so101_new_calib_z6lpjsh8\\usdex_so101_new_calib\\so101_new_calib.usdc
+
+
+Generated from Composed Stage of root layer C:\\Users\\vicsh\\AppData\\Local\\Temp\\urdf_import_so101_new_calib_z6lpjsh8\\temp_so101_new_calib\\so101_new_calib.usd
+
+
+Generated from Composed Stage of root layer C:\\Users\\vicsh\\Projects\\lerobot_on_track\\isaac_assets\\so101_new_calib\\payloads\\base.usd
+"""
+    kilogramsPerUnit = 1
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Scope "Materials"
+{
+    def Material "tn__3d_printed_"
+    {
+        color3f inputs:diffuseColor = (1, 0.63828325, 0.013411746)
+        float inputs:metallic = 0
+        float inputs:opacity = 1
+        float inputs:roughness = 0.5
+        token inputs:wrapMode = "repeat"
+        token outputs:displacement (
+            displayGroup = "Outputs"
+        )
+        prepend token outputs:displacement.connect = </Materials/tn__3d_printed_/PreviewSurface.outputs:displacement>
+        token outputs:surface (
+            displayGroup = "Outputs"
+        )
+        prepend token outputs:surface.connect = </Materials/tn__3d_printed_/PreviewSurface.outputs:surface>
+        token outputs:volume (
+            displayGroup = "Outputs"
+        )
+
+        def Shader "PreviewSurface" (
+            apiSchemas = ["NodeDefAPI"]
+        )
+        {
+            token info:id = "UsdPreviewSurface"
+            prepend color3f inputs:diffuseColor.connect = </Materials/tn__3d_printed_.inputs:diffuseColor>
+            prepend float inputs:metallic.connect = </Materials/tn__3d_printed_.inputs:metallic>
+            prepend float inputs:opacity.connect = </Materials/tn__3d_printed_.inputs:opacity>
+            prepend float inputs:roughness.connect = </Materials/tn__3d_printed_.inputs:roughness>
+            token outputs:displacement
+            token outputs:surface
+        }
+    }
+
+    def Material "sts3215"
+    {
+        color3f inputs:diffuseColor = (0.010022826, 0.010022826, 0.010022826)
+        float inputs:metallic = 0
+        float inputs:opacity = 1
+        float inputs:roughness = 0.5
+        token inputs:wrapMode = "repeat"
+        token outputs:displacement (
+            displayGroup = "Outputs"
+        )
+        prepend token outputs:displacement.connect = </Materials/sts3215/PreviewSurface.outputs:displacement>
+        token outputs:surface (
+            displayGroup = "Outputs"
+        )
+        prepend token outputs:surface.connect = </Materials/sts3215/PreviewSurface.outputs:surface>
+        token outputs:volume (
+            displayGroup = "Outputs"
+        )
+
+        def Shader "PreviewSurface" (
+            apiSchemas = ["NodeDefAPI"]
+        )
+        {
+            token info:id = "UsdPreviewSurface"
+            prepend color3f inputs:diffuseColor.connect = </Materials/sts3215.inputs:diffuseColor>
+            prepend float inputs:metallic.connect = </Materials/sts3215.inputs:metallic>
+            prepend float inputs:opacity.connect = </Materials/sts3215.inputs:opacity>
+            prepend float inputs:roughness.connect = </Materials/sts3215.inputs:roughness>
+            token outputs:displacement
+            token outputs:surface
+        }
+    }
+}
+

@@ -1,0 +1,298 @@
+#usda 1.0
+(
+    customLayerData = {
+        string creator = "URDF USD Converter v0.1.3"
+    }
+    defaultPrim = "so101_new_calib"
+    doc = """Generated from Composed Stage of root layer C:\\Users\\vicsh\\AppData\\Local\\Temp\\tmp9ykd1p0p\\so101_new_calib.usdc
+
+
+Generated from Composed Stage of root layer C:\\Users\\vicsh\\AppData\\Local\\Temp\\urdf_import_so101_new_calib_z6lpjsh8\\usdex_so101_new_calib\\so101_new_calib.usdc
+
+
+Generated from Composed Stage of root layer C:\\Users\\vicsh\\AppData\\Local\\Temp\\urdf_import_so101_new_calib_z6lpjsh8\\temp_so101_new_calib\\so101_new_calib.usd
+
+
+Generated from Composed Stage of root layer C:\\Users\\vicsh\\Projects\\lerobot_on_track\\isaac_assets\\so101_new_calib\\payloads\\base.usd
+"""
+    kilogramsPerUnit = 1
+    metersPerUnit = 1
+    subLayers = [
+        @./physics.usda@
+    ]
+    upAxis = "Z"
+)
+
+over "so101_new_calib"
+{
+    over "Physics"
+    {
+        def MjcActuator "gripper_actuator"
+        {
+            uniform double mjc:forceRange:max = 10
+            uniform double mjc:forceRange:min = -10
+            custom rel mjc:target
+            prepend rel mjc:target = </so101_new_calib/Physics/gripper>
+        }
+
+        def MjcActuator "wrist_roll_actuator"
+        {
+            uniform double mjc:forceRange:max = 10
+            uniform double mjc:forceRange:min = -10
+            custom rel mjc:target
+            prepend rel mjc:target = </so101_new_calib/Physics/wrist_roll>
+        }
+
+        def MjcActuator "wrist_flex_actuator"
+        {
+            uniform double mjc:forceRange:max = 10
+            uniform double mjc:forceRange:min = -10
+            custom rel mjc:target
+            prepend rel mjc:target = </so101_new_calib/Physics/wrist_flex>
+        }
+
+        def MjcActuator "elbow_flex_actuator"
+        {
+            uniform double mjc:forceRange:max = 10
+            uniform double mjc:forceRange:min = -10
+            custom rel mjc:target
+            prepend rel mjc:target = </so101_new_calib/Physics/elbow_flex>
+        }
+
+        def MjcActuator "shoulder_lift_actuator"
+        {
+            uniform double mjc:forceRange:max = 10
+            uniform double mjc:forceRange:min = -10
+            custom rel mjc:target
+            prepend rel mjc:target = </so101_new_calib/Physics/shoulder_lift>
+        }
+
+        def MjcActuator "shoulder_pan_actuator"
+        {
+            uniform double mjc:forceRange:max = 10
+            uniform double mjc:forceRange:min = -10
+            custom rel mjc:target
+            prepend rel mjc:target = </so101_new_calib/Physics/shoulder_pan>
+        }
+
+        over "root_joint"
+        {
+        }
+
+        over "gripper_frame_joint"
+        {
+        }
+
+        over "gripper" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+        )
+        {
+        }
+
+        over "wrist_roll" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+        )
+        {
+        }
+
+        over "wrist_flex" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+        )
+        {
+        }
+
+        over "elbow_flex" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+        )
+        {
+        }
+
+        over "shoulder_lift" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+        )
+        {
+        }
+
+        over "shoulder_pan" (
+            delete apiSchemas = ["PhysicsDriveAPI:angular", "PhysicsJointStateAPI:angular"]
+        )
+        {
+        }
+    }
+
+    over "Geometry"
+    {
+        over "base_link"
+        {
+            over "shoulder_link"
+            {
+                over "upper_arm_link"
+                {
+                    over "lower_arm_link"
+                    {
+                        over "wrist_link"
+                        {
+                            over "gripper_link"
+                            {
+                                over "moving_jaw_so101_v1_link"
+                                {
+                                    over "moving_jaw_so101_v1"
+                                    {
+                                    }
+
+                                    over "moving_jaw_so101_v1_1"
+                                    {
+                                    }
+                                }
+
+                                over "gripper_frame_link"
+                                {
+                                    over "origin"
+                                    {
+                                    }
+                                }
+
+                                over "sts3215_03a_v1"
+                                {
+                                }
+
+                                over "wrist_roll_follower_so101_v1"
+                                {
+                                }
+
+                                over "sts3215_03a_v1_1"
+                                {
+                                }
+
+                                over "wrist_roll_follower_so101_v1_1"
+                                {
+                                }
+                            }
+
+                            over "sts3215_03a_no_horn_v1"
+                            {
+                            }
+
+                            over "wrist_roll_pitch_so101_v2"
+                            {
+                            }
+
+                            over "sts3215_03a_no_horn_v1_1"
+                            {
+                            }
+
+                            over "wrist_roll_pitch_so101_v2_1"
+                            {
+                            }
+                        }
+
+                        over "under_arm_so101_v1"
+                        {
+                        }
+
+                        over "motor_holder_so101_wrist_v1"
+                        {
+                        }
+
+                        over "sts3215_03a_v1"
+                        {
+                        }
+
+                        over "under_arm_so101_v1_1"
+                        {
+                        }
+
+                        over "motor_holder_so101_wrist_v1_1"
+                        {
+                        }
+
+                        over "sts3215_03a_v1_1"
+                        {
+                        }
+                    }
+
+                    over "sts3215_03a_v1"
+                    {
+                    }
+
+                    over "upper_arm_so101_v1"
+                    {
+                    }
+
+                    over "sts3215_03a_v1_1"
+                    {
+                    }
+
+                    over "upper_arm_so101_v1_1"
+                    {
+                    }
+                }
+
+                over "sts3215_03a_v1"
+                {
+                }
+
+                over "motor_holder_so101_base_v1"
+                {
+                }
+
+                over "rotation_pitch_so101_v1"
+                {
+                }
+
+                over "sts3215_03a_v1_1"
+                {
+                }
+
+                over "motor_holder_so101_base_v1_1"
+                {
+                }
+
+                over "rotation_pitch_so101_v1_1"
+                {
+                }
+            }
+
+            over "base_motor_holder_so101_v1"
+            {
+            }
+
+            over "base_so101_v2"
+            {
+            }
+
+            over "sts3215_03a_v1"
+            {
+            }
+
+            over "waveshare_mounting_plate_so101_v2"
+            {
+            }
+
+            over "base_motor_holder_so101_v1_1"
+            {
+            }
+
+            over "base_so101_v2_1"
+            {
+            }
+
+            over "sts3215_03a_v1_1"
+            {
+            }
+
+            over "waveshare_mounting_plate_so101_v2_1"
+            {
+            }
+        }
+    }
+
+    over "Materials"
+    {
+    }
+
+    over "VisualMaterials"
+    {
+    }
+}
+
