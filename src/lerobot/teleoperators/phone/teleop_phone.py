@@ -44,6 +44,8 @@ from .config_phone import PhoneConfig, PhoneOS
 
 logger = logging.getLogger(__name__)
 
+IOS_ENABLE_BUTTONS = ("b1", "b2")
+
 
 class BasePhone:
     _enabled: bool = False
@@ -111,7 +113,7 @@ class IOSPhone(BasePhone, Teleoperator):
         print(
             "Hold the phone so that: top edge points forward in same direction as the robot (robot +x) and screen points up (robot +z)"
         )
-        print("Press and hold B1 in the HEBI Mobile I/O app to capture this pose...\n")
+        print("Press and hold B1, or B2 if B1 is not reported, in the HEBI Mobile I/O app to capture this pose...\n")
         position, rotation = self._wait_for_capture_trigger()
         self._calib_pos = position.copy()
         self._calib_rot_inv = rotation.inv()
@@ -138,10 +140,20 @@ class IOSPhone(BasePhone, Teleoperator):
 
             io = getattr(fb_pose, "io", None)
             button_b = getattr(io, "b", None) if io is not None else None
-            button_b1_pressed = False
+            enable_button_pressed = False
             if button_b is not None:
-                button_b1_pressed = bool(button_b.get_int(1))
-            if button_b1_pressed:
+                for channel in (1, 2):
+                    try:
+                        enable_button_pressed = bool(button_b.get_int(channel))
+                    except Exception:
+                        if hasattr(button_b, "get_bool"):
+                            try:
+                                enable_button_pressed = bool(button_b.get_bool(channel))
+                            except Exception:
+                                pass
+                    if enable_button_pressed:
+                        break
+            if enable_button_pressed:
                 return position, rotation
 
             time.sleep(0.01)
@@ -191,13 +203,25 @@ class IOSPhone(BasePhone, Teleoperator):
                     if bank_a.has_float(ch):
                         raw_inputs[f"a{ch}"] = float(bank_a.get_float(ch))
             if bank_b:
+                # HEBI Mobile I/O exposes B1 well enough for calibration through get_int(1),
+                # but has_int(1) can be false on some setups. Preserve B1 explicitly because
+                # it is the continuous teleop enable gate.
+                for ch in range(1, 9):
+                    try:
+                        raw_inputs[f"b{ch}"] = int(bank_b.get_int(ch))
+                    except Exception:
+                        if hasattr(bank_b, "get_bool"):
+                            try:
+                                raw_inputs[f"b{ch}"] = int(bank_b.get_bool(ch))
+                            except Exception:
+                                pass
                 for ch in range(1, 9):
                     if bank_b.has_int(ch):
                         raw_inputs[f"b{ch}"] = int(bank_b.get_int(ch))
                     elif hasattr(bank_b, "has_bool") and bank_b.has_bool(ch):
                         raw_inputs[f"b{ch}"] = int(bank_b.get_bool(ch))
 
-        enable = bool(raw_inputs.get("b1", 0))
+        enable = any(bool(raw_inputs.get(button, 0)) for button in IOS_ENABLE_BUTTONS)
 
         # Rising edge then re-capture calibration immediately from current raw pose
         if enable and not self._enabled:

@@ -52,10 +52,11 @@ HF_REPO_ID = "<hf_username>/<dataset_repo_id>"
 
 def main():
     # Create the robot and teleoperator configurations
-    camera_config = {"front": OpenCVCameraConfig(index_or_path=0, width=640, height=480, fps=FPS)}
+    camera_config = {"front": OpenCVCameraConfig(index_or_path=0, width=640, height=480, fps=FPS, fourcc="MJPG"),
+                     "base":  OpenCVCameraConfig(index_or_path=2, width=640, height=480, fps=FPS, fourcc="MJPG"),}
     robot_config = SO100FollowerConfig(
-        port="/dev/tty.usbmodem5A460814411",
-        id="my_awesome_follower_arm",
+        port="/dev/ttyACM0",
+        id="so101_follower",
         cameras=camera_config,
         use_degrees=True,
     )

@@ -36,12 +36,26 @@ from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 FPS = 30
+ENABLE_RERUN = False
+DEBUG_TELEOP = True
+DEBUG_PRINT_INTERVAL_S = 1.0
+
+
+def _format_debug_dict(values: dict, max_items: int | None = None) -> str:
+    items = list(values.items())
+    if max_items is not None:
+        items = items[:max_items]
+    return ", ".join(f"{key}={value:.2f}" if isinstance(value, float) else f"{key}={value}" for key, value in items)
+
+
+def _format_vector(values) -> str:
+    return "[" + ", ".join(f"{float(value):+.3f}" for value in values) + "]"
 
 
 def main():
     # Initialize the robot and teleoperator
     robot_config = SO100FollowerConfig(
-        port="/dev/tty.usbmodem5A460814411", id="my_awesome_follower_arm", use_degrees=True
+        port="/dev/ttyACM0", id="so101_follower", use_degrees=True
     )
     teleop_config = PhoneConfig(phone_os=PhoneOS.IOS)  # or PhoneOS.ANDROID
 
@@ -89,13 +103,16 @@ def main():
     robot.connect()
     teleop_device.connect()
 
-    # Init rerun viewer
-    init_rerun(session_name="phone_so100_teleop")
+    # Rerun can crash on some Raspberry Pi/native library setups; keep phone teleop headless by default.
+    if ENABLE_RERUN:
+        init_rerun(session_name="phone_so100_teleop")
 
     if not robot.is_connected or not teleop_device.is_connected:
         raise ValueError("Robot or teleop is not connected!")
 
     print("Starting teleop loop. Move your phone to teleoperate the robot...")
+    print("Debug: hold B1 while moving. If enabled=False, the phone is not commanding motion.")
+    last_debug_print_s = 0.0
     while True:
         t0 = time.perf_counter()
 
@@ -109,10 +126,25 @@ def main():
         joint_action = phone_to_robot_joints_processor((phone_obs, robot_obs))
 
         # Send action to robot
-        _ = robot.send_action(joint_action)
+        sent_action = robot.send_action(joint_action)
+
+        if DEBUG_TELEOP and t0 - last_debug_print_s >= DEBUG_PRINT_INTERVAL_S:
+            raw_inputs = phone_obs.get("phone.raw_inputs", {})
+            enabled = phone_obs.get("phone.enabled", False)
+            phone_pos = phone_obs.get("phone.pos")
+            motor_obs = {key: value for key, value in robot_obs.items() if key.endswith(".pos")}
+
+            print("\n[teleop debug]")
+            print(f"  phone.enabled={enabled} raw_inputs={{ {_format_debug_dict(raw_inputs)} }}")
+            print(f"  phone.pos={_format_vector(phone_pos) if phone_pos is not None else None}")
+            print(f"  robot_obs={{ {_format_debug_dict(motor_obs)} }}")
+            print(f"  joint_action={{ {_format_debug_dict(joint_action)} }}")
+            print(f"  sent_action={{ {_format_debug_dict(sent_action)} }}")
+            last_debug_print_s = t0
 
         # Visualize
-        log_rerun_data(observation=phone_obs, action=joint_action)
+        if ENABLE_RERUN:
+            log_rerun_data(observation=phone_obs, action=joint_action)
 
         precise_sleep(max(1.0 / FPS - (time.perf_counter() - t0), 0.0))
 
