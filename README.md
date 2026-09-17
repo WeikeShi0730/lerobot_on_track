@@ -64,6 +64,38 @@ While these devices are natively integrated into the LeRobot codebase, the libra
 
 For detailed hardware setup guides, see the [Hardware Documentation](https://huggingface.co/docs/lerobot/integrate_hardware).
 
+### Tracked SO-101 robot bill of materials
+
+This list covers the complete tracked robot. The SO-101 arm is one item here; its internal parts are covered by the [SO-101 assembly guide](./docs/source/so101.mdx#source-the-parts).
+
+| Part | Quantity | Notes |
+| --- | ---: | --- |
+| SO-101 arm | 1 | Complete follower arm. |
+| Raspberry Pi 5 (8 GB) | 1 | Onboard computer. |
+| microSD card (at least 32 GB) | 1 | Operating system storage for the Pi. |
+| UVC USB cameras | 2 | Include suitable USB cables and mounts. |
+| L298N dual motor driver module | 1 | Drives the two track motors. |
+| 37 mm, 12 V, 100 RPM DC geared motors | 2 | Higher RPM is possible; check torque and current as well as speed. |
+| 3S LiPo battery (preferred; 2S optional) | 1 | Track motor supply; confirm the motors' and driver's voltage and current ratings. |
+| LiPo battery connector | 1 mating pair | Male and female halves; match the battery connector. |
+| LiPo balance charger | 1 | Must support the selected battery's cell count and connector. |
+| Power bank | 1 | Powers the Pi and arm; use a 5 V output for the Pi, preferably rated for 5 A. A 5 V, 3 A output can work with lighter USB loads. Check the arm's supply requirements separately. |
+| Jumper wires and power/USB cables | As needed | For the driver, battery, Pi, cameras, and arm. |
+| Printed chassis, plates, tracks, wheels, and brackets | 1 set | Includes the base and top plates, front and rear wheels, and guide-wheel brackets. |
+
+| Fastener | Quantity | Use |
+| --- | ---: | --- |
+| M3 × 6 mm screws | 10 | 4 for the motor driver; 6 for the guide-wheel brackets. |
+| M3 × 8 mm screws | 21 | 12 for the drive motors; 7 for the base plate to body; 2 for the rear wheel shafts. |
+| M3 × 12 mm screws | 2 | Guide-wheel brackets. |
+| M3 × 16 mm screws | 6 | Tracks. |
+| M3 × 20 mm screws | 8 | 4 for the arm to top plate; 4 for the top plate to body. |
+| M8 × 60 mm bolts (or 50 mm) | 2 | Front wheel axles; confirm the length against the printed parts. |
+
+**Screw total:** 47 M3 screws across the five lengths above, plus 2 M8 bolts. Buying an assorted M3 screw kit is recommended; check that it contains enough of each length.
+
+**Before ordering:** 3S is preferred because a 2S LiPo may leave a 12 V motor underpowered, especially after the [L298N's voltage drop](https://www.st.com/resource/en/datasheet/l298.pdf). Confirm the motors' stall current against the driver's rating, and choose a battery, connector, and wiring rated for that current. Check the SO-101 arm's required supply voltage against the power bank output. With a [5 V, 3 A supply, the Pi 5 limits USB peripherals to 600 mA](https://www.raspberrypi.com/documentation/computers/raspberry-pi.html#power-supply); a suitable 5 V, 5 A supply raises that limit to 1.6 A. Check the combined draw of the two cameras and other USB devices. Nuts, washers, and hardware for mounting the Pi and cameras depend on the printed design and are not counted above.
+
 ## LeRobot Dataset
 
 To solve the data fragmentation problem in robotics, we utilize the **LeRobotDataset** format.
