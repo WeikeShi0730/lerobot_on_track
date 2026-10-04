@@ -17,8 +17,8 @@ from collections.abc import Sequence
 from typing import Any
 
 from lerobot.configs import PipelineFeatureType
+from lerobot.lerobot_types import RobotAction, RobotObservation
 from lerobot.processor import DataProcessorPipeline
-from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE, OBS_STR
 from lerobot.utils.feature_utils import hw_to_dataset_features
 
@@ -36,7 +36,10 @@ def create_initial_features(
     Returns:
         The initial features dictionary structured by PipelineFeatureType.
     """
-    features = {PipelineFeatureType.ACTION: {}, PipelineFeatureType.OBSERVATION: {}}
+    features: dict[PipelineFeatureType, dict[str, Any]] = {
+        PipelineFeatureType.ACTION: {},
+        PipelineFeatureType.OBSERVATION: {},
+    }
     if action:
         features[PipelineFeatureType.ACTION] = action
     if observation:
@@ -45,13 +48,13 @@ def create_initial_features(
 
 
 # Helper to filter state/action keys based on compiled regex patterns.
-def should_keep(key: str, patterns: tuple[re.Pattern] | None) -> bool:
+def should_keep(key: str, patterns: tuple[re.Pattern[str], ...] | None) -> bool:
     if patterns is None:
         return True
     return any(pat.search(key) for pat in patterns)
 
 
-def strip_prefix(key: str, prefixes_to_strip: tuple[str]) -> str:
+def strip_prefix(key: str, prefixes_to_strip: tuple[str, ...]) -> str:
     for prefix in prefixes_to_strip:
         if key.startswith(prefix):
             return key[len(prefix) :]

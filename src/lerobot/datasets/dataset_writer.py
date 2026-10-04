@@ -155,7 +155,7 @@ class DatasetWriter:
 
     def _create_episode_buffer(self, episode_index: int | None = None) -> dict:
         current_ep_idx = self._meta.total_episodes if episode_index is None else episode_index
-        ep_buffer = {}
+        ep_buffer: dict = {}
         ep_buffer["size"] = 0
         ep_buffer["task"] = []
         for key in self._meta.features:
@@ -171,6 +171,23 @@ class DatasetWriter:
 
     def _get_image_file_dir(self, episode_index: int, image_key: str) -> Path:
         return self._get_image_file_path(episode_index, image_key, frame_index=0).parent
+
+    def _get_episode_buffer_index(self) -> int:
+        episode_index = self.episode_buffer["episode_index"]
+        # episode_index is `int` when freshly created, but becomes `np.ndarray` after
+        # save_episode() mutates the buffer. Handle both types here.
+        if isinstance(episode_index, np.ndarray):
+            episode_index = episode_index.item() if episode_index.size == 1 else episode_index[0]
+        return int(episode_index)
+
+    def _delete_camera_frame_dirs(self, camera_keys: list[str]) -> None:
+        if self.image_writer is not None:
+            self._wait_image_writer()
+        episode_index = self._get_episode_buffer_index()
+        for camera_key in camera_keys:
+            img_dir = self._get_image_file_dir(episode_index, camera_key)
+            if img_dir.is_dir():
+                shutil.rmtree(img_dir)
 
     def _save_image(
         self, image: torch.Tensor | np.ndarray | PIL.Image.Image, fpath: Path, compress_level: int = 1
@@ -292,10 +309,10 @@ class DatasetWriter:
         self._wait_image_writer()
 
         has_video_keys = len(self._meta.video_keys) > 0
-        use_streaming = self._streaming_encoder is not None and has_video_keys
+        streaming_encoder = self._streaming_encoder if has_video_keys else None
         use_batched_encoding = self._batch_encoding_size > 1
 
-        if use_streaming:
+        if streaming_encoder is not None:
             non_video_buffer = {
                 k: v
                 for k, v in episode_buffer.items()
@@ -308,8 +325,8 @@ class DatasetWriter:
 
         ep_metadata = self._save_episode_data(episode_buffer)
 
-        if use_streaming:
-            streaming_results = self._streaming_encoder.finish_episode()
+        if streaming_encoder is not None:
+            streaming_results = streaming_encoder.finish_episode()
             for video_key in self._meta.video_keys:
                 normalization_factor = 255.0 if video_key not in self._meta.depth_keys else 1.0
                 temp_path, video_stats = streaming_results[video_key]
@@ -369,7 +386,12 @@ class DatasetWriter:
                 self._episodes_since_last_encoding = 0
 
         if episode_data is None:
-            self.clear_episode_buffer(delete_images=len(self._meta.image_keys) > 0)
+            # Post-save cleanup deliberately does not go through clear_episode_buffer():
+            # staging frames of video cameras must survive here — the (possibly batched)
+            # encoder still needs them and deletes them once each video is written.
+            if len(self._meta.image_keys) > 0:
+                self._delete_camera_frame_dirs(self._meta.image_keys)
+            self.episode_buffer = self._create_episode_buffer()
 
     def _batch_save_episode_video(self, start_episode: int, end_episode: int | None = None) -> None:
         """Batch save videos for multiple episodes."""
@@ -492,6 +514,12 @@ class DatasetWriter:
         else:
             ep_path = temp_path
 
+        video_path_template = self._meta.video_path
+        if video_path_template is None:
+            raise ValueError(
+                f"Dataset '{self._meta.repo_id}' has no video_path template: it stores no videos."
+            )
+
         ep_size_in_mb = get_file_size_in_mb(ep_path)
         ep_duration_in_s = get_video_duration_in_s(ep_path)
 
@@ -508,7 +536,7 @@ class DatasetWriter:
                     old_chunk_idx, old_file_idx, self._meta.chunks_size
                 )
             latest_duration_in_s = 0.0
-            new_path = self._root / self._meta.video_path.format(
+            new_path = self._root / video_path_template.format(
                 video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
             )
             new_path.parent.mkdir(parents=True, exist_ok=True)
@@ -518,7 +546,7 @@ class DatasetWriter:
             chunk_idx = latest_ep[f"videos/{video_key}/chunk_index"][0]
             file_idx = latest_ep[f"videos/{video_key}/file_index"][0]
 
-            latest_path = self._root / self._meta.video_path.format(
+            latest_path = self._root / video_path_template.format(
                 video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
             )
             latest_size_in_mb = get_file_size_in_mb(latest_path)
@@ -526,7 +554,7 @@ class DatasetWriter:
 
             if latest_size_in_mb + ep_size_in_mb >= self._meta.video_files_size_in_mb:
                 chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self._meta.chunks_size)
-                new_path = self._root / self._meta.video_path.format(
+                new_path = self._root / video_path_template.format(
                     video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
                 )
                 new_path.parent.mkdir(parents=True, exist_ok=True)
@@ -561,10 +589,10 @@ class DatasetWriter:
         return metadata
 
     def clear_episode_buffer(self, delete_images: bool = True) -> None:
-        """Discard the current episode buffer and optionally delete temp images.
+        """Discard the current episode buffer and optionally delete temp camera frames.
 
         Args:
-            delete_images: If ``True``, remove temporary image directories
+            delete_images: If ``True``, remove temporary camera frame directories
                 written for the current episode.
         """
         # Cancel streaming encoder if active
@@ -572,17 +600,7 @@ class DatasetWriter:
             self._streaming_encoder.cancel_episode()
 
         if delete_images:
-            if self.image_writer is not None:
-                self._wait_image_writer()
-            episode_index = self.episode_buffer["episode_index"]
-            # episode_index is `int` when freshly created, but becomes `np.ndarray` after
-            # save_episode() mutates the buffer. Handle both types here.
-            if isinstance(episode_index, np.ndarray):
-                episode_index = episode_index.item() if episode_index.size == 1 else episode_index[0]
-            for cam_key in self._meta.image_keys:
-                img_dir = self._get_image_file_dir(episode_index, cam_key)
-                if img_dir.is_dir():
-                    shutil.rmtree(img_dir)
+            self._delete_camera_frame_dirs(self._meta.camera_keys)
 
         self.episode_buffer = self._create_episode_buffer()
 
