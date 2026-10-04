@@ -28,7 +28,7 @@ import numpy as np
 import torch
 from gymnasium import spaces
 
-from lerobot.types import RobotObservation
+from lerobot.lerobot_types import RobotObservation
 from lerobot.utils.import_utils import _scipy_available
 
 from .utils import _LazyAsyncVectorEnv
@@ -250,8 +250,8 @@ def _load_robotwin_setup_kwargs(task_name: str) -> dict[str, Any]:
 
     import os
 
-    import yaml  # type: ignore[import-untyped]
-    from envs import CONFIGS_PATH  # type: ignore[import-not-found]
+    import yaml
+    from envs import CONFIGS_PATH
 
     task_config = "demo_clean"
     with open(os.path.join(CONFIGS_PATH, f"{task_config}.yml"), encoding="utf-8") as f:
@@ -384,7 +384,9 @@ class RoboTwinEnv(gym.Env):
 
         self._env: Any | None = None  # deferred — created on first reset() inside worker
         self._step_count: int = 0
-        self._black_frame = np.zeros((self.observation_height, self.observation_width, 3), dtype=np.uint8)
+        self._black_frame: np.ndarray = np.zeros(
+            (self.observation_height, self.observation_width, 3), dtype=np.uint8
+        )
 
         image_spaces = {
             cam: spaces.Box(

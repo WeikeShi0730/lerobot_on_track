@@ -21,6 +21,7 @@ from typing import Any
 import torch
 
 from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
+from lerobot.lerobot_types import EnvTransition, TransitionKey
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -33,14 +34,13 @@ from lerobot.processor import (
     ProcessorStepRegistry,
     RenameObservationsProcessorStep,
     UnnormalizerProcessorStep,
+    load_pretrained_policy_processors,
 )
 from lerobot.processor.converters import (
     batch_to_transition,
-    create_transition,
     policy_action_to_transition,
     transition_to_policy_action,
 )
-from lerobot.types import EnvTransition, TransitionKey
 from lerobot.utils.constants import (
     ACTION,
     DONE,
@@ -56,23 +56,17 @@ from lerobot.utils.constants import (
 from .configuration_evo1 import Evo1Config
 
 
-def evo1_batch_to_transition(batch: dict[str, Any]):
+def evo1_batch_to_transition(batch: dict[str, Any]) -> EnvTransition:
     transition = batch_to_transition(batch)
-    complementary_data = dict(transition.get("complementary_data") or {})
+    complementary_data = dict(transition[TransitionKey.COMPLEMENTARY_DATA] or {})
     reserved = {ACTION, REWARD, DONE, TRUNCATED, INFO}
     for key, value in batch.items():
         if key in reserved or key.startswith(OBS_PREFIX):
             continue
         complementary_data.setdefault(key, value)
-    return create_transition(
-        observation=transition.get("observation"),
-        action=transition.get("action"),
-        reward=transition.get("reward", 0.0),
-        done=transition.get("done", False),
-        truncated=transition.get("truncated", False),
-        info=transition.get("info", {}),
-        complementary_data=complementary_data,
-    )
+    new_transition = transition.copy()
+    new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
+    return new_transition
 
 
 @dataclass
@@ -121,7 +115,7 @@ class Evo1PadActionProcessorStep(ProcessorStep):
         action = transition.get(TransitionKey.ACTION)
         if action is None:
             return transition
-        if not isinstance(action, PolicyAction):
+        if not isinstance(action, torch.Tensor):
             raise ValueError(f"EVO1 action should be a PolicyAction tensor, but got {type(action)}.")
 
         action_dim = action.shape[-1]
@@ -239,6 +233,10 @@ def _evo1_action_dim(config: Evo1Config) -> int:
 
 
 def _evo1_normalization_features(config: Evo1Config) -> dict[str, PolicyFeature]:
+    if config.input_features is None or config.output_features is None:
+        raise ValueError(
+            "`Evo1Config.input_features` and `output_features` must be resolved before building processors."
+        )
     features = {**config.input_features, **config.output_features}
     features[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(config.max_state_dim,))
     features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(config.max_action_dim,))
@@ -302,6 +300,33 @@ def _pad_evo1_stats(
     return padded_stats
 
 
+def _refresh_evo1_normalization_steps(
+    config: Evo1Config,
+    preprocessor: PolicyProcessorPipeline,
+    postprocessor: PolicyProcessorPipeline,
+) -> None:
+    """Re-pad checkpoint-loaded (un)normalizer stats/features to EVO1's fixed widths.
+
+    Loading a checkpoint injects the raw dataset stats (unpadded to max_state_dim/max_action_dim)
+    into the (un)normalizer via the generic override path in make_pre_post_processors. Those stats
+    and their declared features must be re-padded/reshaped to EVO1's fixed widths, otherwise
+    normalization fails against the padded state/action tensors (e.g. state padded to 24 vs. 8-dim
+    LIBERO stats). Padding is a no-op when stats are already at the target width.
+    """
+    normalization_features = _evo1_normalization_features(config)
+    action_features = _evo1_action_features(config)
+    for step in preprocessor.steps:
+        if isinstance(step, NormalizerProcessorStep):
+            step.features = normalization_features
+            step.stats = _pad_evo1_stats(config, step.stats)
+            step.to(device=step.device, dtype=step.dtype)
+    for step in postprocessor.steps:
+        if isinstance(step, UnnormalizerProcessorStep):
+            step.features = action_features
+            step.stats = _pad_evo1_stats(config, step.stats)
+            step.to(device=step.device, dtype=step.dtype)
+
+
 def reconcile_evo1_processors(
     config: Evo1Config,
     preprocessor: PolicyProcessorPipeline,
@@ -309,15 +334,18 @@ def reconcile_evo1_processors(
 ) -> tuple[PolicyProcessorPipeline, PolicyProcessorPipeline]:
     """Reconcile checkpoint-loaded pipelines with the current EVO1 config.
 
-    Two things cannot be restored from a serialized pipeline alone: the EVO1 batch converter
-    (converters are plain functions and are never serialized), and eval-time CLI overrides of the
-    action postprocessing flags (`postprocess_action_dim`, `binarize_gripper`, `gripper_*`). This
-    restores the converter and rebuilds the action step from the current config so those overrides
-    take effect.
+    Three things cannot be restored from a serialized pipeline alone: the EVO1 batch converter
+    (converters are plain functions and are never serialized), eval-time CLI overrides of the
+    action postprocessing flags (`postprocess_action_dim`, `binarize_gripper`, `gripper_*`), and the
+    (un)normalizer stats/features when the generic override path injects raw, unpadded dataset
+    stats. This restores the converter, re-pads the normalization stats to EVO1's fixed widths, and
+    rebuilds the action step from the current config so those overrides take effect.
     """
     # Pipelines reloaded from a checkpoint come back with the default batch converter, which drops
     # non-observation extras (embodiment_id, state_mask, custom task fields) needed by EVO1.
     preprocessor.to_transition = evo1_batch_to_transition
+
+    _refresh_evo1_normalization_steps(config, preprocessor, postprocessor)
 
     action_step = Evo1ActionProcessorStep(
         action_dim=_evo1_action_dim(config),
@@ -344,6 +372,35 @@ def reconcile_evo1_processors(
     return preprocessor, postprocessor
 
 
+def make_evo1_pre_post_processors_from_pretrained(
+    config: Evo1Config,
+    pretrained_path: str,
+    *,
+    revision: str | None = None,
+    dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
+    dataset_meta: Any | None = None,
+    preprocessor_overrides: dict[str, Any] | None = None,
+    postprocessor_overrides: dict[str, Any] | None = None,
+    preprocessor_config_filename: str = f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
+    postprocessor_config_filename: str = f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json",
+) -> tuple[
+    PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
+    PolicyProcessorPipeline[PolicyAction, PolicyAction],
+]:
+    """Load the serialized EVO1 pipelines and reconcile them with the current config."""
+    # EVO1 stats reach the (un)normalizers through the overrides, then get re-padded by reconcile.
+    del dataset_stats, dataset_meta
+    preprocessor, postprocessor = load_pretrained_policy_processors(
+        pretrained_path,
+        revision=revision,
+        preprocessor_overrides=preprocessor_overrides,
+        postprocessor_overrides=postprocessor_overrides,
+        preprocessor_config_filename=preprocessor_config_filename,
+        postprocessor_config_filename=postprocessor_config_filename,
+    )
+    return reconcile_evo1_processors(config, preprocessor, postprocessor)
+
+
 def make_evo1_pre_post_processors(
     config: Evo1Config,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
@@ -354,6 +411,10 @@ def make_evo1_pre_post_processors(
     normalization_features = _evo1_normalization_features(config)
     action_features = _evo1_action_features(config)
     normalization_stats = _pad_evo1_stats(config, dataset_stats)
+    device = config.device
+    if device is None:
+        # PreTrainedConfig.__post_init__ always resolves a device; None here is a programming error.
+        raise ValueError("`Evo1Config.device` is unset; cannot build the device processor step.")
 
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
@@ -365,7 +426,7 @@ def make_evo1_pre_post_processors(
             norm_map=config.normalization_mapping,
             stats=normalization_stats,
         ),
-        DeviceProcessorStep(device=config.device),
+        DeviceProcessorStep(device=device),
     ]
     output_steps = [
         UnnormalizerProcessorStep(

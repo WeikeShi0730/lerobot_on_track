@@ -62,7 +62,7 @@ from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 from pprint import pformat
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import einops
 import gymnasium as gym
@@ -72,7 +72,7 @@ from termcolor import colored
 from torch import Tensor, nn
 from tqdm import trange
 
-from lerobot.configs import FeatureType, parser
+from lerobot.configs import FeatureType, PolicyFeature, parser
 from lerobot.configs.eval import EvalPipelineConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.envs import (
@@ -82,12 +82,14 @@ from lerobot.envs import (
     make_env_pre_post_processors,
     preprocess_observation,
 )
+from lerobot.envs.utils import NEW_ROLLOUT_OPTION
+from lerobot.lerobot_types import PolicyAction
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
-from lerobot.processor import PolicyProcessorPipeline
-from lerobot.types import PolicyAction
+from lerobot.processor import PolicyProcessorPipeline, bind_relative_anchor
 from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, OBS_IMAGES, OBS_STR, REWARD
 from lerobot.utils.device_utils import get_safe_torch_device
-from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.eval_stats import success_summary
+from lerobot.utils.import_utils import _peft_available, register_third_party_plugins, require_package
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import (
@@ -95,10 +97,18 @@ from lerobot.utils.utils import (
     inside_slurm,
 )
 
+if TYPE_CHECKING or _peft_available:
+    from peft import PeftModel
+else:
+    PeftModel = None
 
-def _env_features_to_dataset_features(env_features: dict) -> dict:
+
+logger = logging.getLogger(__name__)
+
+
+def _env_features_to_dataset_features(env_features: dict[str, PolicyFeature]) -> dict[str, dict[str, Any]]:
     """Convert EnvConfig.features to the dict format expected by LeRobotDataset.create()."""
-    features = {}
+    features: dict[str, dict[str, Any]] = {}
     for key, ft in env_features.items():
         shape = tuple(ft.shape)
         if ft.type is FeatureType.VISUAL:
@@ -207,9 +217,16 @@ def rollout(
     """
     assert isinstance(policy, nn.Module), "Policy must be a PyTorch nn module."
 
-    # Reset the policy and environments.
+    # Reset the policy, its processors and the environments. The processors matter: a step that
+    # latches per-episode state -- e.g. ``RelativeActionsProcessorStep``'s cached anchor -- would
+    # otherwise carry the previous batch of episodes' value into this one.
+    # ``SyncInferenceEngine`` already does this on the robot.
     policy.reset()
-    observation, info = env.reset(seed=seeds)
+    preprocessor.reset()
+    postprocessor.reset()
+    # NEW_ROLLOUT_OPTION tells FreezeAfterEpisodeEnd this is a genuine new episode, as
+    # opposed to Gymnasium's argument-less autoreset of a sub-env that already finished.
+    observation, info = env.reset(seed=seeds, options={NEW_ROLLOUT_OPTION: True})
     if render_callback is not None:
         render_callback(env)
 
@@ -245,6 +262,18 @@ def rollout(
     all_rewards = []
     all_successes = []
     all_dones = []
+
+    # A relative-action policy predicts a chunk of offsets anchored to the state at prediction
+    # time, but this loop reruns the pre/post pipeline every step, which would re-anchor queued
+    # actions to the current (moved) state. Bind the step to the policy's queue depth so it holds
+    # the anchor until the chunk drains. Done here rather than in `eval_main` so that every caller
+    # of this public loop is covered; rebinding the same callable each rollout is a no-op.
+    # The anchor is [B, state_dim] and tracks exactly what the single shared action queue tracks,
+    # so it inherits the queue's batching assumptions rather than adding any: every sub-env
+    # refills on the same step, and a sub-env that finished early is frozen by
+    # FreezeAfterEpisodeEnd and its transitions discarded.
+    if bind_relative_anchor(policy, preprocessor) is not None:
+        logging.info("Relative actions enabled: chunk anchor held until the action queue drains")
 
     step = 0
     # Keep track of which environments are done.
@@ -444,15 +473,16 @@ def eval_policy(
         exc = ValueError(
             f"Policy of type 'PreTrainedPolicy' is expected, but type '{type(policy)}' was provided."
         )
-        try:
-            from peft import PeftModel
-
-            if not isinstance(policy, PeftModel):
-                raise exc
-        except ImportError:
-            raise exc from None
+        if not _peft_available:
+            raise exc
+        require_package("peft", extra="peft")
+        if not isinstance(policy, PeftModel):
+            raise exc
 
     start = time.time()
+    # Preserve the mode for direct callers. eval_policy_all scopes the mode
+    # around all tasks so parallel evaluations cannot race with each other.
+    was_training = policy.training
     policy.eval()
 
     # Determine how many batched rollouts we need to get n_episodes. Note that if n_episodes is not evenly
@@ -463,7 +493,7 @@ def eval_policy(
     sum_rewards = []
     max_rewards = []
     all_successes = []
-    all_seeds = []
+    all_seeds: list[int | None] = []
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
 
@@ -555,7 +585,7 @@ def eval_policy(
         if seeds:
             all_seeds.extend(seeds)
         else:
-            all_seeds.append(None)
+            all_seeds.extend([None] * env.num_envs)
 
         # FIXME: episode_data is either None or it doesn't exist
         if return_episode_data:
@@ -583,6 +613,8 @@ def eval_policy(
             ):
                 if n_episodes_rendered >= max_episodes_rendered:
                     break
+                if videos_dir is None:  # already validated above
+                    raise ValueError("If max_episodes_rendered > 0, videos_dir must be provided.")
 
                 videos_dir.mkdir(parents=True, exist_ok=True)
                 video_path = videos_dir / f"eval_episode_{n_episodes_rendered}.mp4"
@@ -613,6 +645,8 @@ def eval_policy(
             predicted_video = decoder(predicted_latent)
             if hasattr(predicted_video, "detach"):
                 predicted_video = predicted_video.detach().to("cpu").numpy()
+            if videos_dir is None:  # already validated above
+                raise ValueError("If save_predicted_video is True, videos_dir must be provided.")
             videos_dir.mkdir(parents=True, exist_ok=True)
             predicted_video_path = videos_dir / f"pred_episode_{n_predicted_rendered}.mp4"
             predicted_video_paths.append(str(predicted_video_path))
@@ -637,7 +671,8 @@ def eval_policy(
         thread.join()
 
     # Compile eval info.
-    info = {
+    success_stats = success_summary(all_successes[:n_episodes])
+    info: dict[str, Any] = {
         "per_episode": [
             {
                 "episode_ix": i,
@@ -660,6 +695,9 @@ def eval_policy(
             "avg_sum_reward": float(np.nanmean(sum_rewards[:n_episodes])),
             "avg_max_reward": float(np.nanmean(max_rewards[:n_episodes])),
             "pc_success": float(np.nanmean(all_successes[:n_episodes]) * 100),
+            "n_episodes": success_stats["n_episodes"],
+            "n_success": success_stats["n_success"],
+            "pc_success_ci95": success_stats["pc_success_ci95"],
             "eval_s": time.time() - start,
             "eval_ep_s": (time.time() - start) / n_episodes,
         },
@@ -673,6 +711,8 @@ def eval_policy(
 
     if save_predicted_video:
         info["predicted_video_paths"] = predicted_video_paths
+
+    policy.train(was_training)
 
     return info
 
@@ -723,8 +763,19 @@ def _compile_episode_data(
 
 
 @parser.wrap()
-def eval_main(cfg: EvalPipelineConfig):
+def eval_main(cfg: EvalPipelineConfig) -> None:
     logging.info(pformat(asdict(cfg)))
+
+    if cfg.policy is None:
+        raise ValueError(
+            "Evaluation requires a policy: pass --policy.path=<pretrained_dir> or --policy.type=<name>."
+        )
+    if cfg.policy.device is None:
+        # PreTrainedConfig.__post_init__ always resolves the device, so reaching this is a programming error.
+        raise ValueError("Policy config has no device set.")
+    if cfg.output_dir is None:
+        # EvalPipelineConfig.__post_init__ always assigns a default output_dir.
+        raise ValueError("EvalPipelineConfig.output_dir is not set.")
 
     # Check device is available
     device = get_safe_torch_device(cfg.policy.device, log=True)
@@ -791,13 +842,22 @@ def eval_main(cfg: EvalPipelineConfig):
             recording_repo_id=cfg.eval.recording_repo_id,
             recording_private=cfg.eval.recording_private,
         )
-        print("Overall Aggregated Metrics:")
-        print(info["overall"])
+        logger.info("Overall Aggregated Metrics:")
+        logger.info(info["overall"])
+        ci_low, ci_high = info["overall"]["pc_success_ci95"]
+        logger.info(
+            "Success rate %.1f%% (%d/%d episodes, 95%% Wilson interval %.1f%% to %.1f%%)",
+            info["overall"]["pc_success"],
+            info["overall"]["n_success"],
+            info["overall"]["n_episodes"],
+            ci_low,
+            ci_high,
+        )
 
         # Print per-suite stats
         for task_group, task_group_info in info.items():
-            print(f"\nAggregated Metrics for {task_group}:")
-            print(task_group_info)
+            logger.info(f"\nAggregated Metrics for {task_group}:")
+            logger.info(task_group_info)
     # Close all vec envs
     close_envs(envs)
 
@@ -931,6 +991,16 @@ def run_one(
     return task_group, task_id, metrics
 
 
+def _task_info(task_group: str, task_id: int, metrics: dict) -> dict:
+    """One `per_task` entry: the raw per-episode metrics plus the task's success count and interval."""
+    return {
+        "task_group": task_group,
+        "task_id": task_id,
+        "metrics": metrics,
+        **success_summary(metrics.get("successes") or []),
+    }
+
+
 def eval_policy_all(
     envs: dict[str, dict[int, gym.vector.VectorEnv]],
     policy,
@@ -1010,40 +1080,48 @@ def eval_policy_all(
         recording_private=recording_private,
     )
 
-    if max_parallel_tasks <= 1:
-        prefetch_thread: threading.Thread | None = None
-        for i, (task_group, task_id, env) in enumerate(tasks):
-            if prefetch_thread is not None:
-                prefetch_thread.join()
-                prefetch_thread = None
+    # Set the shared policy's mode before launching any workers. Restoring it
+    # inside individual tasks would let one task enable training mode while
+    # another task is still evaluating.
+    was_training = policy.training
+    policy.eval()
+    try:
+        if max_parallel_tasks <= 1:
+            prefetch_thread: threading.Thread | None = None
+            for i, (task_group, task_id, env) in enumerate(tasks):
+                if prefetch_thread is not None:
+                    prefetch_thread.join()
+                    prefetch_thread = None
 
-            try:
-                tg, tid, metrics = task_runner(task_group, task_id, env)
-                _accumulate_to(tg, metrics)
-                per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
-            finally:
-                env.close()
-                # Prefetch next task's workers *after* closing current env to prevent
-                # GPU memory overlap between consecutive tasks.
-                if i + 1 < len(tasks):
-                    next_env = tasks[i + 1][2]
-                    if hasattr(next_env, "_ensure"):
-                        prefetch_thread = threading.Thread(target=next_env._ensure, daemon=True)
-                        prefetch_thread.start()
-    else:
-        with cf.ThreadPoolExecutor(max_workers=max_parallel_tasks) as executor:
-            fut2meta = {}
-            for task_group, task_id, env in tasks:
-                fut = executor.submit(task_runner, task_group, task_id, env)
-                fut2meta[fut] = (task_group, task_id, env)
-            for fut in cf.as_completed(fut2meta):
-                tg, tid, env = fut2meta[fut]
                 try:
-                    tg, tid, metrics = fut.result()
+                    tg, tid, metrics = task_runner(task_group, task_id, env)
                     _accumulate_to(tg, metrics)
-                    per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
+                    per_task_infos.append(_task_info(tg, tid, metrics))
                 finally:
                     env.close()
+                    # Prefetch next task's workers *after* closing current env to prevent
+                    # GPU memory overlap between consecutive tasks.
+                    if i + 1 < len(tasks):
+                        next_env = tasks[i + 1][2]
+                        if hasattr(next_env, "_ensure"):
+                            prefetch_thread = threading.Thread(target=next_env._ensure, daemon=True)
+                            prefetch_thread.start()
+        else:
+            with cf.ThreadPoolExecutor(max_workers=max_parallel_tasks) as executor:
+                fut2meta = {}
+                for task_group, task_id, env in tasks:
+                    fut = executor.submit(task_runner, task_group, task_id, env)
+                    fut2meta[fut] = (task_group, task_id, env)
+                for fut in cf.as_completed(fut2meta):
+                    tg, tid, env = fut2meta[fut]
+                    try:
+                        tg, tid, metrics = fut.result()
+                        _accumulate_to(tg, metrics)
+                        per_task_infos.append(_task_info(tg, tid, metrics))
+                    finally:
+                        env.close()
+    finally:
+        policy.train(was_training)
 
     # compute aggregated metrics helper (robust to lists/scalars)
     def _agg_from_list(xs):
@@ -1055,21 +1133,27 @@ def eval_policy_all(
     # compute per-group aggregates
     groups_aggregated = {}
     for group, acc in group_acc.items():
+        group_success = success_summary(acc["successes"])
         groups_aggregated[group] = {
             "avg_sum_reward": _agg_from_list(acc["sum_rewards"]),
             "avg_max_reward": _agg_from_list(acc["max_rewards"]),
             "pc_success": _agg_from_list(acc["successes"]) * 100 if acc["successes"] else float("nan"),
             "n_episodes": len(acc["sum_rewards"]),
+            "n_success": group_success["n_success"],
+            "pc_success_ci95": group_success["pc_success_ci95"],
             "video_paths": list(acc["video_paths"]),
             "predicted_video_paths": list(acc["predicted_video_paths"]),
         }
 
     # overall aggregates
+    overall_success = success_summary(overall["successes"])
     overall_agg = {
         "avg_sum_reward": _agg_from_list(overall["sum_rewards"]),
         "avg_max_reward": _agg_from_list(overall["max_rewards"]),
         "pc_success": _agg_from_list(overall["successes"]) * 100 if overall["successes"] else float("nan"),
         "n_episodes": len(overall["sum_rewards"]),
+        "n_success": overall_success["n_success"],
+        "pc_success_ci95": overall_success["pc_success_ci95"],
         "eval_s": time.time() - start_t,
         "eval_ep_s": (time.time() - start_t) / max(1, len(overall["sum_rewards"])),
         "video_paths": list(overall["video_paths"]),
