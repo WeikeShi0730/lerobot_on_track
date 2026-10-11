@@ -82,6 +82,8 @@ class RemoteTcpFollower(Robot):
     def connect(self, calibrate: bool = True) -> None:
         del calibrate
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Small action + obs request messages back to back: Nagle would hold the second one.
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.settimeout(self.config.timeout_s)
         try:
             sock.connect((self.config.host, self.config.tcp_port))

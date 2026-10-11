@@ -675,6 +675,7 @@ def main():
     try:
         while True:
             conn, addr = server_sock.accept()
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             print(f"[server] Client connected from {addr}")
             handle_client(
                 conn, robot_arm, motors, cam_buffer,
