@@ -609,7 +609,7 @@ def test_setup_defaults_to_starting_the_engine():
 
     engine = MagicMock()
     ctx = SimpleNamespace(
-        runtime=SimpleNamespace(cfg=SimpleNamespace(interpolation_multiplier=2)),
+        runtime=SimpleNamespace(cfg=SimpleNamespace(interpolation_multiplier=2, action_smoothing_alpha=1.0)),
         policy=SimpleNamespace(inference=engine),
     )
     strategy = MinimalStrategy(BaseStrategyConfig())

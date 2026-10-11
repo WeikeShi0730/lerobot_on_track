@@ -51,15 +51,21 @@ class ActionInterpolator:
             dataset.add_frame(...)
     """
 
-    def __init__(self, multiplier: int = 1):
+    def __init__(self, multiplier: int = 1, smoothing_alpha: float = 1.0):
         """Initialize the interpolator.
 
         Args:
             multiplier: Control rate multiplier (1 = no interpolation, 2 = 2x, 3 = 3x, etc.)
+            smoothing_alpha: EMA low-pass weight on each emitted action, in (0, 1].
+                1.0 = no filtering; lower = smoother but more lag.
         """
         if multiplier < 1:
             raise ValueError(f"multiplier must be >= 1, got {multiplier}")
+        if not 0.0 < smoothing_alpha <= 1.0:
+            raise ValueError(f"smoothing_alpha must be in (0, 1], got {smoothing_alpha}")
         self.multiplier = multiplier
+        self.smoothing_alpha = smoothing_alpha
+        self._filtered: Tensor | None = None
         self._prev: Tensor | None = None
         self._buffer: list[Tensor] = []
         self._idx = 0
@@ -93,6 +99,7 @@ class ActionInterpolator:
         self._buffer = []
         self._idx = 0
         self._emitted_policy_action = False
+        self._filtered = None
 
     def needs_new_action(self) -> bool:
         """Check if a new action is needed from the queue."""
@@ -131,6 +138,10 @@ class ActionInterpolator:
             self._emitted_policy_action = False
             return None
         action = self._buffer[self._idx]
+        if self.smoothing_alpha < 1.0:
+            if self._filtered is not None:
+                action = self.smoothing_alpha * action + (1.0 - self.smoothing_alpha) * self._filtered
+            self._filtered = action
         self._idx += 1
         self._emitted_policy_action = self._idx == len(self._buffer)
         return action

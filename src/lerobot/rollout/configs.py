@@ -313,6 +313,9 @@ class RolloutConfig:
     # the robot at ``fps × multiplier`` Hz while policy inference and dataset
     # recording stay at ``fps`` Hz.
     interpolation_multiplier: int = 1
+    # EMA low-pass filter on every command sent to the robot, in (0, 1].
+    # 1.0 = off. Lower values damp jitter but add lag (~(1-a)/a ticks).
+    action_smoothing_alpha: float = 1.0
     device: str | None = None
     task: str = ""
     display_data: bool = False
@@ -347,6 +350,8 @@ class RolloutConfig:
         """Validate config invariants and load the policy config from ``--policy.path``."""
         if self.interpolation_multiplier < 1:
             raise ValueError(f"interpolation_multiplier must be >= 1, got {self.interpolation_multiplier}")
+        if not 0.0 < self.action_smoothing_alpha <= 1.0:
+            raise ValueError(f"action_smoothing_alpha must be in (0, 1], got {self.action_smoothing_alpha}")
 
         # --- Strategy capabilities ---
         # Read off the strategy's declarations, never its concrete type, so a

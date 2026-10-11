@@ -596,3 +596,25 @@ def test_queue_interpolator_delay_skips_stale_actions():
     first_action = queue.get()
     assert first_action is not None
     torch.testing.assert_close(first_action, torch.tensor([103.0, 103.0]))
+
+
+# ====================== Smoothing Tests ======================
+
+
+def test_smoothing_alpha_out_of_range_raises():
+    for alpha in (0.0, -0.1, 1.5):
+        with pytest.raises(ValueError):
+            ActionInterpolator(smoothing_alpha=alpha)
+
+
+def test_smoothing_ema_and_reset():
+    interp = ActionInterpolator(smoothing_alpha=0.5)
+    interp.add(torch.tensor([0.0]))
+    assert torch.equal(interp.get(), torch.tensor([0.0]))
+    interp.add(torch.tensor([4.0]))
+    assert torch.equal(interp.get(), torch.tensor([2.0]))
+    interp.add(torch.tensor([4.0]))
+    assert torch.equal(interp.get(), torch.tensor([3.0]))
+    interp.reset()
+    interp.add(torch.tensor([8.0]))
+    assert torch.equal(interp.get(), torch.tensor([8.0]))

@@ -91,7 +91,10 @@ class RolloutStrategy(abc.ABC):
         Call this from ``setup()`` so strategies share identical
         initialisation without duplicating code.
         """
-        self._interpolator = ActionInterpolator(multiplier=ctx.runtime.cfg.interpolation_multiplier)
+        self._interpolator = ActionInterpolator(
+            multiplier=ctx.runtime.cfg.interpolation_multiplier,
+            smoothing_alpha=ctx.runtime.cfg.action_smoothing_alpha,
+        )
         self._engine = ctx.policy.inference
         logger.info("Starting inference engine...")
         self.reset_control_state()
