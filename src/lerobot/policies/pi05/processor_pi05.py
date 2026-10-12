@@ -61,7 +61,8 @@ class YoloTargetBoxProcessorStep(ProcessorStep):
     """Draw a box around the object that the task prompt names, so the policy knows which object to grab.
 
     The target is each YOLO class name that occurs in the task string, e.g. "sock" in
-    "pick up the sock and put it in the container". Only the top-scoring match gets a box.
+    "pick up the sock and put it in the container". Every match gets a box, because the
+    demonstrations grab any one of them, not the top-scoring one.
     If YOLO finds no match, the frame stays unchanged.
     """
 
@@ -104,9 +105,8 @@ class YoloTargetBoxProcessorStep(ProcessorStep):
             target_ids = [i for i, name in names.items() if name in task.lower()]
             boxes = result.boxes
             match = torch.isin(boxes.cls.long(), torch.tensor(target_ids, device=boxes.cls.device))
-            if match.any():
-                best = boxes.conf.masked_fill(~match, -1).argmax()
-                _draw_box(image, boxes.xyxy[best].tolist())
+            for xyxy in boxes.xyxy[match].tolist():
+                _draw_box(image, xyxy)
 
         transition = transition.copy()
         transition[TransitionKey.OBSERVATION] = {**observation, self.camera_key: images}
