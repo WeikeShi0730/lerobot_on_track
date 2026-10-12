@@ -78,11 +78,6 @@ dependencies = [
     "pyserial>=3.5,<4.0",
     "wandb>=0.24.0,<0.25.0",
 
-    "torch>=2.2.1,<2.11.0", # TODO: Bump dependency
-    "torchcodec>=0.2.1,<0.11.0; sys_platform != 'win32' and (sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')) and (sys_platform != 'darwin' or platform_machine != 'x86_64')", # TODO: Bump dependency
-    "torchvision>=0.21.0,<0.26.0", # TODO: Bump dependency
-    "torchaudio>=2.2.1,<2.11.0", # TODO: Bump dependency
-
     # Environments
     # NOTE: gymnasium is used in lerobot.envs (lerobot-train, lerobot-eval), policies/factory,
     # and robots/unitree. Moving it to an optional extra would require import guards across many
