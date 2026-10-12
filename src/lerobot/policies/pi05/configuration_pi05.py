@@ -53,6 +53,13 @@ class PI05Config(PreTrainedConfig):
     memory_stride: int = 30
     memory_temporal_attention_every: int = 4
 
+    # YOLO target box: if `yolo_model` is set, the preprocessor draws a box around the
+    # object that the task prompt names (a YOLO class name, e.g. "sock") on `yolo_camera_key`.
+    # The same step runs in training and inference. Requires `lerobot[yolo]`.
+    yolo_model: str | None = None
+    yolo_camera_key: str = "observation.images.base"
+    yolo_conf: float = 0.25
+
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
     max_action_dim: int = 32

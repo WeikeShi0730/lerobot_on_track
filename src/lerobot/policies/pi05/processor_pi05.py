@@ -15,7 +15,7 @@
 # limitations under the License.
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -35,8 +35,96 @@ from lerobot.processor import (
     make_policy_processor_pipelines,
 )
 from lerobot.utils.constants import OBS_STATE
+from lerobot.utils.import_utils import require_package
 
 from .configuration_pi05 import PI05Config
+
+
+def _draw_box(image: torch.Tensor, xyxy: list[float], thickness: int = 6) -> None:
+    """Draw a green box outline in place on a [C, H, W] image in [0, 1].
+
+    6 px at 640 wide is still ~2 px after the resize to 224 inside the model.
+    """
+    _, h, w = image.shape
+    x1, y1 = max(int(xyxy[0]), 0), max(int(xyxy[1]), 0)
+    x2, y2 = min(int(xyxy[2]), w), min(int(xyxy[3]), h)
+    color = torch.tensor([0.0, 1.0, 0.0], dtype=image.dtype, device=image.device).view(3, 1, 1)
+    image[:, y1 : y1 + thickness, x1:x2] = color
+    image[:, max(y2 - thickness, y1) : y2, x1:x2] = color
+    image[:, y1:y2, x1 : x1 + thickness] = color
+    image[:, y1:y2, max(x2 - thickness, x1) : x2] = color
+
+
+@ProcessorStepRegistry.register(name="pi05_yolo_target_box_processor_step")
+@dataclass
+class YoloTargetBoxProcessorStep(ProcessorStep):
+    """Draw a box around the object that the task prompt names, so the policy knows which object to grab.
+
+    The target is each YOLO class name that occurs in the task string, e.g. "sock" in
+    "pick up the sock and put it in the container". Only the top-scoring match gets a box.
+    If YOLO finds no match, the frame stays unchanged.
+    """
+
+    model_path: str = ""
+    camera_key: str = "observation.images.base"
+    conf: float = 0.25
+    device: str | None = None
+    task_key: str = "task"
+    _model: Any = field(default=None, init=False, repr=False)
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        observation = transition.get(TransitionKey.OBSERVATION) or {}
+        tasks = (transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}).get(self.task_key)
+        if self.camera_key not in observation:
+            raise KeyError(
+                f"YOLO camera key '{self.camera_key}' not in observation keys {list(observation)}. "
+                "If you use --rename_map, set --policy.yolo_camera_key to the renamed key."
+            )
+        if tasks is None:
+            return transition
+        if isinstance(tasks, str):
+            tasks = [tasks]
+
+        images = observation[self.camera_key]
+        if images.ndim != 4:
+            raise ValueError(
+                f"Expected [B, C, H, W] images for '{self.camera_key}', got {tuple(images.shape)}"
+            )
+
+        if self._model is None:
+            require_package("ultralytics", extra="yolo")
+            from ultralytics import YOLO
+
+            self._model = YOLO(self.model_path)
+
+        results = self._model.predict(images, conf=self.conf, device=self.device, verbose=False)
+        names: dict[int, str] = self._model.names
+        images = images.clone()
+        for image, task, result in zip(images, tasks, results, strict=True):
+            target_ids = [i for i, name in names.items() if name in task.lower()]
+            boxes = result.boxes
+            match = torch.isin(boxes.cls.long(), torch.tensor(target_ids, device=boxes.cls.device))
+            if match.any():
+                best = boxes.conf.masked_fill(~match, -1).argmax()
+                _draw_box(image, boxes.xyxy[best].tolist())
+
+        transition = transition.copy()
+        transition[TransitionKey.OBSERVATION] = {**observation, self.camera_key: images}
+        return transition
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "model_path": self.model_path,
+            "camera_key": self.camera_key,
+            "conf": self.conf,
+            "device": self.device,
+            "task_key": self.task_key,
+        }
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
 
 
 @ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")
@@ -162,6 +250,14 @@ def make_pi05_pre_post_processors(
         ),
         steps.to_device,
     ]
+    if config.yolo_model:
+        yolo_step = YoloTargetBoxProcessorStep(
+            model_path=config.yolo_model,
+            camera_key=config.yolo_camera_key,
+            conf=config.yolo_conf,
+            device=config.device,
+        )
+        input_steps.insert(input_steps.index(steps.add_batch_dim) + 1, yolo_step)
 
     output_steps: list[ProcessorStep] = [
         steps.unnormalize,

@@ -231,6 +231,7 @@ wallx = [
     "lerobot[qwen-vl-utils-dep]",
 ]
 pi = ["lerobot[transformers-dep]", "lerobot[scipy-dep]"]
+yolo = ["ultralytics>=8.3.0,<9.0.0"] # NOTE: ultralytics is AGPL-3.0
 molmoact2 = ["lerobot[transformers-dep]", "lerobot[peft-dep]", "lerobot[scipy-dep]"]
 smolvla = ["lerobot[transformers-dep]", "num2words>=0.5.14,<0.6.0", "lerobot[accelerate-dep]"]
 multi_task_dit = ["lerobot[transformers-dep]", "lerobot[diffusers-dep]"]
