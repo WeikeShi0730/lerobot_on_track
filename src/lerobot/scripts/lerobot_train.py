@@ -395,7 +395,7 @@ def make_dataloaders(
         # when an iterator is recreated after checkpoint resume.
         generator=torch.Generator().manual_seed(cfg.seed) if cfg.seed is not None else None,
         pin_memory=device_type == "cuda",
-        drop_last=False,
+        drop_last=True,
         collate_fn=collate_fn,
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
         persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
