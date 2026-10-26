@@ -58,7 +58,7 @@ class PI05Config(PreTrainedConfig):
     # The same step runs in training and inference. Requires `lerobot[yolo]`.
     yolo_model: str | None = None
     yolo_camera_key: str = "observation.images.base"
-    yolo_conf: float = 0.25
+    yolo_conf: float = 0.5
 
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32

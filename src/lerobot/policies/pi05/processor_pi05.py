@@ -42,11 +42,8 @@ from lerobot.utils.import_utils import require_package
 from .configuration_pi05 import PI05Config
 
 
-def _draw_box(image: torch.Tensor, xyxy: list[float], thickness: int = 6) -> None:
-    """Draw a green box outline in place on a [C, H, W] image in [0, 1].
-
-    6 px at 640 wide is still ~2 px after the resize to 224 inside the model.
-    """
+def _draw_box(image: torch.Tensor, xyxy: list[float], thickness: int) -> None:
+    """Draw a green box outline in place on a [C, H, W] image in [0, 1]."""
     _, h, w = image.shape
     x1, y1 = max(int(xyxy[0]), 0), max(int(xyxy[1]), 0)
     x2, y2 = min(int(xyxy[2]), w), min(int(xyxy[3]), h)
@@ -78,7 +75,9 @@ class YoloTargetBoxProcessorStep(ProcessorStep):
 
     model_path: str = ""
     camera_key: str = "observation.images.base"
-    conf: float = 0.25
+    conf: float = 0.5
+    # 12 px at 640 wide is ~4 px after the resize to 224 inside the model.
+    thickness: int = 12
     device: str | None = None
     task_key: str = "task"
     _model: Any = field(default=None, init=False, repr=False)
@@ -116,7 +115,7 @@ class YoloTargetBoxProcessorStep(ProcessorStep):
             boxes = result.boxes
             match = torch.isin(boxes.cls.long(), torch.tensor(target_ids, device=boxes.cls.device))
             for xyxy in boxes.xyxy[match].tolist():
-                _draw_box(image, xyxy)
+                _draw_box(image, xyxy, self.thickness)
 
         transition = transition.copy()
         transition[TransitionKey.OBSERVATION] = {**observation, self.camera_key: images}
@@ -127,6 +126,7 @@ class YoloTargetBoxProcessorStep(ProcessorStep):
             "model_path": self.model_path,
             "camera_key": self.camera_key,
             "conf": self.conf,
+            "thickness": self.thickness,
             "device": self.device,
             "task_key": self.task_key,
         }
