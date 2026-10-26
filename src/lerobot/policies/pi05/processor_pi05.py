@@ -16,10 +16,12 @@
 
 from copy import deepcopy
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+from huggingface_hub import hf_hub_download
 
 from lerobot.configs import PipelineFeatureType, PolicyFeature
 from lerobot.lerobot_types import EnvTransition, TransitionKey
@@ -53,6 +55,14 @@ def _draw_box(image: torch.Tensor, xyxy: list[float], thickness: int = 6) -> Non
     image[:, max(y2 - thickness, y1) : y2, x1:x2] = color
     image[:, y1:y2, x1 : x1 + thickness] = color
     image[:, y1:y2, max(x2 - thickness, x1) : x2] = color
+
+
+def _yolo_file(model_path: str) -> str:
+    """A local file, else "<user>/<repo>/<file>" in a Hugging Face Hub repo."""
+    if Path(model_path).is_file():
+        return model_path
+    user, repo, filename = model_path.split("/", 2)
+    return hf_hub_download(f"{user}/{repo}", filename)
 
 
 @ProcessorStepRegistry.register(name="pi05_yolo_target_box_processor_step")
@@ -96,7 +106,7 @@ class YoloTargetBoxProcessorStep(ProcessorStep):
             require_package("ultralytics", extra="yolo")
             from ultralytics import YOLO
 
-            self._model = YOLO(self.model_path)
+            self._model = YOLO(_yolo_file(self.model_path))
 
         results = self._model.predict(images, conf=self.conf, device=self.device, verbose=False)
         names: dict[int, str] = self._model.names

@@ -48,3 +48,13 @@ def test_box_on_prompt_target_only():
     assert sock[:, 100:200, 100:200].sum() == 0
     # No class name in the prompt: image unchanged.
     assert out[1].sum() == 0
+
+
+def test_yolo_file_local_or_hub():
+    from unittest.mock import patch
+
+    from lerobot.policies.pi05 import processor_pi05
+
+    assert processor_pi05._yolo_file(__file__) == __file__
+    with patch.object(processor_pi05, "hf_hub_download", lambda repo, f: f"cache/{repo}/{f}"):
+        assert processor_pi05._yolo_file("user/repo/yolo/best.pt") == "cache/user/repo/yolo/best.pt"
