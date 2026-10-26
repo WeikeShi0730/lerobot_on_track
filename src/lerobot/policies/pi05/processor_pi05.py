@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,6 +41,8 @@ from lerobot.utils.constants import OBS_STATE
 from lerobot.utils.import_utils import require_package
 
 from .configuration_pi05 import PI05Config
+
+logger = logging.getLogger(__name__)
 
 
 def _draw_box(image: torch.Tensor, xyxy: list[float], thickness: int) -> None:
@@ -110,12 +113,32 @@ class YoloTargetBoxProcessorStep(ProcessorStep):
         results = self._model.predict(images, conf=self.conf, device=self.device, verbose=False)
         names: dict[int, str] = self._model.names
         images = images.clone()
+        n_targets = []
         for image, task, result in zip(images, tasks, results, strict=True):
             target_ids = [i for i, name in names.items() if name in task.lower()]
             boxes = result.boxes
             match = torch.isin(boxes.cls.long(), torch.tensor(target_ids, device=boxes.cls.device))
+            n_targets.append(int(match.sum()))
             for xyxy in boxes.xyxy[match].tolist():
                 _draw_box(image, xyxy, self.thickness)
+
+        # Show what the policy sees: Foxglove otherwise only gets the raw camera frame.
+        # /policy/yolo_detections shows every detection with label and score, for debugging.
+        from lerobot.utils.foxglove_visualization import _log_foxglove_image, log_foxglove_data
+
+        if getattr(log_foxglove_data, "server", None) is not None:
+            _log_foxglove_image(
+                "/policy/yolo_target", self.camera_key, images[0].float().cpu().numpy(), compress_images=True
+            )
+            _log_foxglove_image(  # plot() returns BGR
+                "/policy/yolo_detections", self.camera_key, results[0].plot()[..., ::-1], compress_images=True
+            )
+            boxes = results[0].boxes
+            dets = ", ".join(
+                f"{names[int(c)]} {s:.2f}"
+                for c, s in zip(boxes.cls.tolist(), boxes.conf.tolist(), strict=True)
+            )
+            logger.info("YOLO target boxes: %d | detections: %s", n_targets[0], dets or "none")
 
         transition = transition.copy()
         transition[TransitionKey.OBSERVATION] = {**observation, self.camera_key: images}
