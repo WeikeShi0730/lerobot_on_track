@@ -162,10 +162,11 @@ class ServerStats:
 # ──────────────────────────────────────────────────────────────
 
 class MotorController:
-    def __init__(self, m1_forward=16, m1_backward=1, m1_enable=12,
-                       m2_forward=5, m2_backward=6, m2_enable=13):
+    def __init__(self, m1_forward=27, m1_backward=17, m1_enable=None,
+                       m2_forward=23, m2_backward=22, m2_enable=None):
         if not GPIO_MOTORS_AVAILABLE:
             raise RuntimeError("gpiozero/lgpio not available")
+        # enable=None: gpiozero puts the PWM on IN1-IN4; keep the ENA/ENB jumpers on the driver.
         self.motor1 = Motor(forward=m1_forward, backward=m1_backward, enable=m1_enable, pwm=True)
         self.motor2 = Motor(forward=m2_forward, backward=m2_backward, enable=m2_enable, pwm=True)
         print("✓ Motors initialised")
@@ -607,12 +608,12 @@ def main():
                         help="Motor backend: Raspberry Pi GPIO or ESP32/Arduino USB serial bridge (default: gpio)")
     parser.add_argument("--motor-serial-port", default="/dev/ttyUSB0",
                         help="Serial port for --motor-backend=serial, e.g. /dev/ttyUSB0 or /dev/ttyACM0")
-    parser.add_argument("--m1-fwd",     type=int, default=16, help="Motor 1 forward GPIO / IN1 (default: 16, physical pin 36)")
-    parser.add_argument("--m1-bwd",     type=int, default=1,  help="Motor 1 backward GPIO / IN2 (default: 1, physical pin 28)")
-    parser.add_argument("--m1-en",      type=int, default=12, help="Motor 1 enable GPIO / ENA (default: 12, physical pin 32)")
-    parser.add_argument("--m2-fwd",     type=int, default=5,  help="Motor 2 forward GPIO / IN3 (default: 5, physical pin 29)")
-    parser.add_argument("--m2-bwd",     type=int, default=6,  help="Motor 2 backward GPIO / IN4 (default: 6, physical pin 31)")
-    parser.add_argument("--m2-en",      type=int, default=13, help="Motor 2 enable GPIO / ENB (default: 13, physical pin 33)")
+    parser.add_argument("--m1-fwd",     type=int, default=27, help="Motor 1 forward GPIO / IN2 (default: 27, physical pin 13)")
+    parser.add_argument("--m1-bwd",     type=int, default=17, help="Motor 1 backward GPIO / IN1 (default: 17, physical pin 11)")
+    parser.add_argument("--m1-en",      type=int, default=None, help="Motor 1 enable GPIO / ENA (default: none, PWM on IN1/IN2; remove the ENA jumper if set)")
+    parser.add_argument("--m2-fwd",     type=int, default=23, help="Motor 2 forward GPIO / IN4 (default: 23, physical pin 16)")
+    parser.add_argument("--m2-bwd",     type=int, default=22, help="Motor 2 backward GPIO / IN3 (default: 22, physical pin 15)")
+    parser.add_argument("--m2-en",      type=int, default=None, help="Motor 2 enable GPIO / ENB (default: none, PWM on IN3/IN4; remove the ENB jumper if set)")
     args = parser.parse_args()
 
     print("  SO-101 Inference Server")
