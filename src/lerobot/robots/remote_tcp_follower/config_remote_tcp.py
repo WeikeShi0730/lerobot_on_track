@@ -43,3 +43,7 @@ class RemoteTcpFollowerConfig(RobotConfig):
     image_shape: tuple[int, int, int] = (480, 640, 3)
     request_arm_mode: bool = True
     request_images: bool = True
+    # Drive the base motors with a local gamepad (LT/RT throttle, left stick turn), as lerobot-inference-client did.
+    manual_motors: bool = False
+    motor_max_speed: float = 1.0
+    motor_send_hz: float = 30.0

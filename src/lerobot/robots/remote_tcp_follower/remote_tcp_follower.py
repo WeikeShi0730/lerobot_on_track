@@ -59,6 +59,7 @@ class RemoteTcpFollower(Robot):
         super().__init__(config)
         self.config = config
         self._sock: socket.socket | None = None
+        self._manual_motors = None
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
@@ -92,6 +93,15 @@ class RemoteTcpFollower(Robot):
                 response = recv_msg(sock)
                 if response.get("type") == "mode_response" and not response.get("ok", False):
                     logger.warning("Remote TCP arm mode denied: %s", response.get("reason", "unknown"))
+            if self.config.manual_motors:
+                from lerobot.scripts.lerobot_inference_client import ManualMotorController
+
+                try:
+                    self._manual_motors = ManualMotorController(
+                        sock, max_speed=self.config.motor_max_speed, send_hz=self.config.motor_send_hz
+                    )
+                except RuntimeError as e:
+                    logger.warning("Manual motor control unavailable (%s); continuing without motors", e)
             self._sock = sock
         except Exception:
             sock.close()
@@ -106,6 +116,8 @@ class RemoteTcpFollower(Robot):
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
         sock = self._require_socket()
+        if self._manual_motors is not None:
+            self._manual_motors.maybe_send()
         send_msg(sock, {"type": "full_obs_request", "images": self.config.request_images})
         msg = recv_msg(sock)
         if msg.get("type") != "full_obs":
@@ -135,6 +147,9 @@ class RemoteTcpFollower(Robot):
     @check_if_not_connected
     def disconnect(self) -> None:
         sock = self._require_socket()
+        if self._manual_motors is not None:
+            self._manual_motors.close()
+            self._manual_motors = None
         try:
             send_msg(sock, {"type": "disconnect"})
         except OSError:
